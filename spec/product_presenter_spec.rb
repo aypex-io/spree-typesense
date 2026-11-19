@@ -69,7 +69,8 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       created_at: Time.utc(2023, 5, 6),
       updated_at: Time.utc(2024, 7, 8),
       custom_fields: custom_fields,
-      collections: [FakeCatalog::Collection.new('coll_summer'), FakeCatalog::Collection.new('coll_linen')]
+      collections: [FakeCatalog::Collection.new('coll_summer'), FakeCatalog::Collection.new('coll_linen')],
+      positions: { 'coll_summer' => 3, 'coll_linen' => 1, 'ctg_shirts' => 4, 'ctg_sale' => 2 }
     )
   end
 
@@ -163,6 +164,10 @@ RSpec.describe SpreeTypesense::ProductPresenter do
     it 'emits no collection_ids: 5.x has no collections' do
       expect(document('en', 'USD')).not_to have_key(:collection_ids)
     end
+
+    it 'emits no positions, as core 5.x does not' do
+      expect(document('en', 'USD').keys.grep(/\Apos_/)).to eq([])
+    end
   end
 
   context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
@@ -229,13 +234,47 @@ RSpec.describe SpreeTypesense::ProductPresenter do
     end
 
     it 'emits the same field names as on 5.6.1, plus collection_ids and option_value_combination_ids' do
-      expect(document('en', 'USD').keys).to eq(
+      expect(document('en', 'USD').keys.reject { |key| key.to_s.start_with?('pos_') }).to eq(
         %i[id product_id locale currency name description slug price compare_at_price status sku in_stock preorder
            store_ids channel_ids discontinue_on category_ids category_names collection_ids option_type_ids
            option_type_names option_value_ids option_value_combination_ids option_values tags units_sold_count
            available_on created_at updated_at] +
         %w[cf_material cf_weight]
       )
+    end
+
+    # The merchant's position in each collection and category, for a manual
+    # listing to sort by inside Typesense (#5).
+    describe 'positions' do
+      def positions(document) = document.select { |key, _| key.to_s.start_with?('pos_') }
+
+      it 'emits the position in each collection' do
+        expect(positions(document('en', 'USD'))).to include('pos_coll_summer' => 3, 'pos_coll_linen' => 1)
+      end
+
+      it 'emits the position in each category and, as the lowest below it, in each ancestor' do
+        expect(positions(document('en', 'USD')))
+          .to include('pos_ctg_shirts' => 4, 'pos_ctg_sale' => 2, 'pos_ctg_apparel' => 2)
+      end
+
+      def positioned_in(positions)
+        teas = FakeCatalog::Category.new(prefixed_id: 'ctg_teas', names: { 'en' => 'Teas' }, parent: apparel)
+        green = FakeCatalog::Category.new(prefixed_id: 'ctg_green', names: { 'en' => 'Green' }, parent: teas)
+        tea = FakeCatalog::Product.new(prefixed_id: 'prod_tea', names: { 'en' => 'Tea' }, prices: { 'USD' => 1 },
+                                       categories: [teas, green], positions: positions)
+        self.positions(described_class.new(tea, store).call.first)
+      end
+
+      it "gives an ancestor the lowest of its own and its descendants' positions" do
+        expect(positioned_in('ctg_teas' => 5, 'ctg_green' => 2))
+          .to eq('pos_ctg_teas' => 2, 'pos_ctg_green' => 2, 'pos_ctg_apparel' => 2)
+        expect(positioned_in('ctg_teas' => 1, 'ctg_green' => 4))
+          .to eq('pos_ctg_teas' => 1, 'pos_ctg_green' => 4, 'pos_ctg_apparel' => 1)
+      end
+
+      it 'emits nothing for a membership without a position' do
+        expect(positioned_in({})).to eq({})
+      end
     end
 
     it 'never reads the names 6.0 deprecated' do

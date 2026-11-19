@@ -283,16 +283,6 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
       expect(errors_logged).to be_empty
     end
 
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
-      it 'lets an error from the Database hand-off of a manually sorted listing propagate' do
-        allow(database).to receive(:search_and_filter).and_raise(Errno::ECONNREFUSED)
-
-        expect { provider.search_and_filter(scope: scope, filters: { 'in_category' => 'ctg_a' }) }
-          .to raise_error(Errno::ECONNREFUSED)
-        expect(database).to have_received(:search_and_filter).once
-        expect(errors_logged).to be_empty
-      end
-    end
   end
 
   # Unconfigured is unavailable too: no 500 from a KeyError on every search.

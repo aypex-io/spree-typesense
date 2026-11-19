@@ -67,6 +67,39 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
     end
   end
 
+  # The merchant's order inside Typesense: documents carry the product's
+  # position in each grouping, and a manual listing sorts by it (#5).
+  context 'a manually sorted listing on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'comes back in the order of the positions' do
+      provider.index_batch([
+        doc('prod_a', name: 'Herbal A').merge('collection_ids' => %w[coll_x], 'pos_coll_x' => 3),
+        doc('prod_b', name: 'Herbal B').merge('collection_ids' => %w[coll_x], 'pos_coll_x' => 1),
+        doc('prod_c', name: 'Herbal C').merge('collection_ids' => %w[coll_x], 'pos_coll_x' => 2)
+      ])
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_a prod_b prod_c]),
+                                          filters: { 'in_collection' => 'coll_x' })
+
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_b prod_c prod_a])
+    end
+
+    # Before the first 0.3.0 reindex, or for a grouping no indexed product
+    # belongs to, no document carries the field: Typesense refuses the sort,
+    # and the Database provider, which sorts by position too, answers. That
+    # is expected, so it is not reported as an error.
+    it 'answers from the Database provider, quietly, while no document carries the position' do
+      provider.index_batch([doc('prod_a', name: 'Herbal A').merge('category_ids' => %w[ctg_x])])
+      database = instance_double(Spree::SearchProvider::Database, search_and_filter: :database_result)
+      allow(Spree::SearchProvider::Database).to receive(:new).and_return(database)
+      allow(Spree::SearchProvider::NULL_ERROR_REPORTER).to receive(:report)
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_a]), filters: { 'in_category' => 'ctg_x' })
+
+      expect(result).to eq(:database_result)
+      expect(Spree::SearchProvider::NULL_ERROR_REPORTER).not_to have_received(:report)
+    end
+  end
+
   # THE security test.
   it 'never returns a product missing from the authorized scope' do
     result = provider.search_and_filter(scope: FakeScope.new(%w[prod_2]), query: 'herbal')
