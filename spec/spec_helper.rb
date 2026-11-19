@@ -196,6 +196,8 @@ RSpec.configure do |config|
     # No channel unless an example sets one: the real fallback (the store's
     # default channel) needs Spree::Store.
     allow(Spree::Current).to receive(:channel).and_return(nil)
+    # The circuit breaker is process-wide; each example starts with it closed.
+    SpreeTypesense::CircuitBreaker.reset_all!
   end
 
   config.before(:suite) do
