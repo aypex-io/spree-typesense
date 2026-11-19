@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-19)
 
 - **CI tests Spree 6.0.5**, the latest release: the second Spree 6 leg moves
   from 6.0.1 to 6.0.5.
@@ -105,7 +105,8 @@ See [Upgrading](README.md#upgrading) for the details.
 ### Known limitations
 
 See [Known limitations](README.md#known-limitations): buyer-catalog
-narrowing is not mirrored in facets; manual sort adds a schema field per
+narrowing is not mirrored in facets; option facet counts beside a selection
+of another option type count products, not variants; manual sort adds a schema field per
 category and collection; filters across more than six option types fall back
 to core's narrowing; `price_between`, `cf_*` and other ransack filters and
 sorts are not served by the index.
