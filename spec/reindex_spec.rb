@@ -20,10 +20,10 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
   end
 
   def stub_presenter(documents_by_id)
-    presenter_class = class_double('SpreeTypesense::ProductPresenter')
+    presenter_class = class_double('Spree::Typesense::ProductPresenter')
     allow(provider).to receive(:presenter_class).and_return(presenter_class)
     allow(presenter_class).to receive(:new) do |p, _store|
-      instance_double(SpreeTypesense::ProductPresenter, call: documents_by_id.fetch(p.id) { [doc_for(p.id)] })
+      instance_double(Spree::Typesense::ProductPresenter, call: documents_by_id.fetch(p.id) { [doc_for(p.id)] })
     end
   end
 

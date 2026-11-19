@@ -1,10 +1,11 @@
-# spree_typesense
+# spree-typesense
 
-A [Typesense](https://typesense.org) search provider for [Spree Commerce](https://spreecommerce.org),
-supporting Spree 5.5 to 6.0 (`spree_core >= 5.5, < 6.1`; tested on 5.5.1, 5.6.1, 6.0.0 and 6.0.5).
+A [Typesense](https://typesense.org) search provider for [Spree Commerce](https://spreecommerce.org) 6
+(`spree_core ~> 6.0`; tested on 6.0.0 and 6.0.5). Its major version tracks
+Spree's, as the other Aypex Spree gems' do.
 
-Spree 5.5 ships two search providers — `Database` and `Meilisearch` (which moved
-into the `spree_meilisearch` gem in 6.0). This gem adds a Typesense one,
+Spree 6 ships a `Database` search provider, and `spree_meilisearch` adds a
+Meilisearch one. This gem adds a Typesense one,
 implementing the same `Spree::SearchProvider::Base` contract so
 nothing downstream changes: it returns Spree's own `SearchResult` and
 `FiltersResult` objects, and Spree's existing indexing jobs and
@@ -17,11 +18,11 @@ a multi-node cluster survives losing a node.
 ## Install
 
 ```ruby
-gem 'spree_typesense', '~> 0.3'
+gem 'spree-typesense', '~> 6.0'
 ```
 
-Releases before 0.3.0 were published as git tags only
-(`gem 'spree_typesense', github: 'aypex-io/spree_typesense', tag: 'v0.2.0'`).
+Before 6.0.0 the gem was `spree_typesense`, published as git tags only, and
+supported Spree 5.5 to 6.0; see [Upgrading](#upgrading).
 
 Then select the provider by environment:
 
@@ -103,16 +104,15 @@ and with it the documents of products that were deleted or left the scope.
 
 ## Known limitations
 
-- **Manual (position) sort uses one field per grouping.** On Spree 6 each
-  document carries `pos_<prefixed id>`, the product's position in each
+- **Manual (position) sort uses one field per grouping.** Each document
+  carries `pos_<prefixed id>`, the product's position in each
   collection and category it belongs to (an ancestor category takes the
   lowest position below it), and a single category or collection listing in
   manual order (`sort` omitted or `manual`, with or without a text query, as
   core decides) sorts by it inside Typesense. Each grouping adds a field to
   the collection's schema, which suits catalogues with hundreds or a few
   thousand groupings. A grouping no indexed document has a position in yet
-  is answered by the `Database` provider. On Spree 5, whose documents carry
-  no positions (as core's did not), `manual` is Typesense's default ranking.
+  is answered by the `Database` provider.
 - **Facets don't apply buyer-catalog narrowing.** Facet counts come from the
   index and the filters given. A category or collection page's own grouping is
   applied (the filters endpoint passes it), but narrowing made only to the
@@ -127,7 +127,13 @@ and with it the documents of products that were deleted or left the scope.
   `-price`, `name`, `-name`, `available_on`, `-available_on` and
   `best_selling`; any other sort, such as `created_at` or a `cf_*` sort, gets
   the default ranking. `cf_*` sorts are not offered.
-- **Values of more than six option types at once.** On Spree 6, values of
+- **Option facet counts are per product.** With values of one option type
+  selected, the counts for another type's values count products that carry
+  the value on any variant: with Blue selected, XL counts a product selling a
+  Red XL beside a Blue S, though choosing XL then lists only products with a
+  Blue XL. The listing and its total are exact; only the counts beside the
+  values can run higher. Spree's Meilisearch provider counts the same way.
+- **Values of more than six option types at once.** Values of
   two to six option types must sit on one variant, and the index answers that
   exactly through one token per set of a variant's values. Beyond six types
   (or 1000 combinations of the selected values) the index only pre-filters by
@@ -141,60 +147,36 @@ error, just wrong answers. Those behaviours are pinned as executable specs in
 `spec/typesense_behaviour_spec.rb`, which doubles as an upgrade canary: run it
 first when bumping the Typesense version.
 
-### Spree versions
+### Documents
 
-The gem builds its documents with its own `SpreeTypesense::ProductPresenter`
-on every Spree version, so the index does not depend on which presenter core
-happens to ship. On 5.x its documents are exactly those of core's
-`Spree::SearchProvider::ProductPresenter` for that release
-(`spec/product_presenter_spec.rb` compares the two field for field): 5.5.x
-emits no `preorder`, 5.6.0 adds it, and 5.6.1 adds `cf_*` keys for searchable
-or sortable metafields. The presenter follows the capabilities core's models
-gained in those releases (`Product#preorder?`, the metafield definition's
-`searchable?`) rather than the patch version.
+The gem builds its documents with its own `Spree::Typesense::ProductPresenter`,
+following `spree_meilisearch`'s presenter. Spree 6 core ships no search
+presenter (`search_product_presenter: nil`); at boot the engine registers this
+one as `Spree::Dependencies.search_product_presenter`, unless the application
+or another search gem already set one, and only when Typesense is the selected
+`Spree.search_provider`, so with `spree_meilisearch` installed alongside, each
+gem's presenter goes with its own provider.
 
 An application can set `Spree::Dependencies.search_product_presenter` to a
-subclass of `SpreeTypesense::ProductPresenter`, and the provider indexes with
-it. Any other presenter there is ignored and the gem's own is used: the
-setting is shared by every installed search gem, and another gem's documents
+subclass of `Spree::Typesense::ProductPresenter`, and the provider indexes with
+it. Any other presenter there is ignored and the gem's own is used: the setting
+is shared by every installed search gem, and another gem's documents
 (`spree_meilisearch`'s, say) do not fit this collection's schema.
 
-`cf_*` keys are stored in each document but are not declared in the schema, so
-Typesense does not index them: they cannot be searched, filtered or sorted on.
-That is the same on 5.6.1 and 6.x.
-
-Spree 6.0 changed what the documents are built from. The gem follows it, and
-emits the same fields as on 5.6:
-
-- **Core ships no search presenter** (`search_product_presenter: nil`). At boot
-  the engine registers `SpreeTypesense::ProductPresenter` as
-  `Spree::Dependencies.search_product_presenter`, unless the application or
-  another search gem already set one — the same pattern as `spree_meilisearch`.
-  It registers only when Typesense is the selected `Spree.search_provider`, so
-  with `spree_meilisearch` installed alongside, each gem's presenter goes with
-  its own provider. Either way the provider indexes with this gem's presenter
-  (see above).
-- **`Spree::Taxon` became `Spree::Category`.** `category_ids` and
-  `category_names` come from `product.categories`, and the category facet
-  looks up `Spree::Category`. `Spree::Taxon` is a deprecated alias on 6.0 and
-  the gem never references it there. The prefixed ids do not change: taxons
-  already carried `ctg_` ids on 5.5 and 5.6.
-- **Option type and value `presentation` became `label`.**
-  `option_type_names` and `option_values` read `label`.
-- **Metafields became custom fields.** `cf_*` keys come from
-  `product.custom_fields`: definitions that are storefront-visible and marked
-  searchable or sortable. As on 5.6.1 they are stored unindexed, so neither
-  flag makes them searchable or sortable in Typesense.
-- **Products belong to collections, and `in_collection` is a whitelisted
-  filter.** Documents carry `collection_ids` (6.x only), and `in_collection`
+- **Categories:** `category_ids` (with every ancestor) and `category_names`
+  come from `product.categories`; the category facet looks up
+  `Spree::Category`. The gem never references the deprecated `Spree::Taxon`.
+- **Options:** `option_type_names` and `option_values` read `label`; option
+  values come from `product.variants`.
+- **Custom fields:** `cf_*` keys come from `product.custom_fields`, for
+  definitions that are storefront-visible and marked searchable or sortable.
+  They are stored but not declared in the schema, so Typesense does not index
+  them: they cannot be searched, filtered or sorted on.
+- **Collections:** documents carry `collection_ids`, and `in_collection`
   filters on it, so a collection listing returns, counts and facets only that
-  collection. A listing in manual (position) order sorts by the product's
-  position in it; see [Known limitations](#known-limitations).
-- **Descriptions are rich-text HTML in a plain column.** `description` is
-  indexed as plain text (`Spree::RichTextHelper.to_plain_text`), as
-  `spree_meilisearch` 6.0 does, so tag names are not searchable.
-- **`variants_including_master` is deprecated.** Option values come from
-  `product.variants`.
+  collection.
+- **Descriptions** are indexed as plain text
+  (`Spree::RichTextHelper.to_plain_text`), so tag names are not searchable.
 - **Base columns are read in the store's content locale.** Spree 6 reads a
   translated attribute's base column only in `Spree::Current.content_locale`,
   which a job or rake task leaves at the application's default locale. The
@@ -207,17 +189,27 @@ emits the same fields as on 5.6:
   Database fallback is built with the same audience, so a back-office search
   does not degrade into a storefront one.
 
-Loading and using the gem on 6.0 triggers no Spree deprecation warning; the
-suite raises on any.
+Loading and using the gem triggers no Spree deprecation warning; the suite
+raises on any.
 
 ## Upgrading
 
-### To 0.3.0
+### From spree_typesense 0.2.0 to spree-typesense 6.0.0
 
-Bump the gem, then run `bin/rake spree:search:reindex` straight after
-deploying. It is required: documents gain `indexed_at`, and on Spree 6
-`option_value_combination_ids` and the `pos_*` position fields, and the
-index moves behind an alias.
+The gem is renamed, as the other Aypex Spree gems are named, and supports
+Spree 6 only. Upgrade Spree first (see [To Spree 6.0](#to-spree-60)) while on
+spree_typesense 0.2.0, which supports both.
+
+1. In the Gemfile, replace `gem 'spree_typesense', github: ...` with
+   `gem 'spree-typesense', '~> 6.0'`.
+2. Rename any reference to the gem's own constants: `SpreeTypesense` is now
+   `Spree::Typesense` (`Spree::Typesense::ProductPresenter` for a presenter
+   subclass). The provider is still `Spree::SearchProvider::Typesense`. Inside
+   `module Spree`, a bare `Typesense` now names the gem's module: reach the
+   typesense-ruby client there as `::Typesense`.
+3. Run `bin/rake spree:search:reindex` straight after deploying. It is
+   required: documents gain `indexed_at`, `option_value_combination_ids` and
+   the `pos_*` position fields, and the index moves behind an alias.
 
 - **The first reindex replaces the 0.2.0 collection.** It builds
   `products_<store code>_v<epoch ms>`, then drops the real collection
@@ -225,27 +217,29 @@ index moves behind an alias.
   name in its place. Typesense refuses an alias named like an existing
   collection, so for the moment between the two, searches get a 404 and
   answer from the `Database` provider.
-- **Until it has run**, on Spree 6, a filter on values of two or more option
-  types asks for a field the old collection lacks, and a manual listing
-  sorts by positions it lacks. Typesense refuses both, and the `Database`
-  provider answers them: correct, more slowly. The option filter is reported
-  as an error; the manual listing only logged. Index jobs keep writing to the
-  old collection.
+- **Until it has run**, a filter on values of two or more option types asks
+  for a field the old collection lacks, and a manual listing sorts by
+  positions it lacks. Typesense refuses both, and the `Database` provider
+  answers them: correct, more slowly. The option filter is reported as an
+  error; the manual listing only logged. Index jobs keep writing to the old
+  collection.
 - **If Typesense rejects a document**, the reindex fails naming it and the
   store keeps the index it had. On a multi-store install
   `spree:search:reindex` then stops at that store: fix the documents and
   rerun it.
-- **Rolling back to 0.2.0** works: its reindex creates a real
+- **Rolling back to spree_typesense 0.2.0** works: its reindex creates a real
   `products_<store code>` again, which Typesense serves ahead of the alias.
   Searches return nothing until that reindex has filled it, so roll back at
-  a quiet time. A later 0.3 reindex drops it and the 0.3 collection left
-  behind.
+  a quiet time. A later spree-typesense reindex drops it and the collection
+  left behind.
 
-On Spree 6, a store whose default market locale differs from the
-application's `config.i18n.default_locale` also gets its product names back
-in the index (they were indexed blank).
+A store whose default market locale differs from the application's
+`config.i18n.default_locale` also gets its product names back in the index
+(they were indexed blank).
 
 ### To Spree 6.0
+
+On spree_typesense 0.2.0:
 
 1. Upgrade Spree, run its migrations, then
    `bin/rake spree:migrate_taxons_to_categories_and_collections`.

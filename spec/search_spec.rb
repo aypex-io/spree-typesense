@@ -49,7 +49,7 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
   # One product sells blue-S and red-XL, another blue-XL: "blue AND XL" is
   # only the second, with an exact total, and the scope is never narrowed by
   # core (FakeScope raises if it is) (#10).
-  context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+  context 'on Spree 6.x' do
     it 'filters values of two option types to products with one variant carrying both' do
       provider.index_batch([
         doc('prod_a', name: 'Herbal A').merge('option_value_ids' => %w[ov_blue ov_s ov_red ov_xl],
@@ -69,7 +69,7 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
 
   # The merchant's order inside Typesense: documents carry the product's
   # position in each grouping, and a manual listing sorts by it (#5).
-  context 'a manually sorted listing on Spree 6.x', if: SpreeTypesense.spree_6? do
+  context 'a manually sorted listing on Spree 6.x' do
     it 'comes back in the order of the positions' do
       provider.index_batch([
         doc('prod_a', name: 'Herbal A').merge('collection_ids' => %w[coll_x], 'pos_coll_x' => 3),
@@ -103,7 +103,7 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
   # A filter far longer than Typesense takes in a GET query string (4000
   # characters): 30 colours by 30 sizes make 900 combination tokens. The
   # search must still be answered by Typesense, not fall back.
-  context 'a long filter on Spree 6.x', if: SpreeTypesense.spree_6? do
+  context 'a long filter on Spree 6.x' do
     it 'is answered by Typesense' do
       colours = (1..30).map { |i| "optval_colour#{i.to_s.rjust(4, '0')}" }
       sizes = (1..30).map { |i| "optval_size#{i.to_s.rjust(4, '0')}" }
@@ -203,9 +203,10 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
       expect(provider.filters(scope: scope, query: 'launch').total_count).to eq(2)
     end
 
-    # Spree 5.5 builds documents with no `preorder` at all. The schema declares
-    # it optional, so filtering on it is valid and matches none of them, and
-    # the publish date alone decides, as before.
+    # A document without `preorder` (written by a release before it was
+    # emitted) still serves: the schema declares it optional, so filtering on
+    # it is valid and matches none of them, and the publish date alone
+    # decides.
     it 'serves documents built without a preorder field' do
       stored = provider.client.collections[provider.collection_name].documents['prod_12_en_USD'].retrieve
       expect(stored).not_to have_key('preorder')
@@ -218,7 +219,7 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
 
   # Spree 6.0 whitelists in_collection; a collection listing must not return
   # the whole catalogue, nor count or facet it.
-  context 'filtering by collection on Spree 6.x', if: SpreeTypesense.spree_6? do
+  context 'filtering by collection on Spree 6.x' do
     before do
       provider.index_batch([
         doc('prod_4', name: 'Herbal Tea', price: 20.0).merge('collection_ids' => %w[coll_summer], 'pos_coll_summer' => 2),

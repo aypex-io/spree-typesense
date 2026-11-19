@@ -43,9 +43,7 @@ module Spree
           # documents for range operators on string fields. A product
           # scheduled to publish later still shows while it is on pre-order,
           # as core's storefront scope (`include_preorderable: true`) and
-          # Meilisearch's `OR preorder = true` keep it. 5.5 documents carry no
-          # `preorder`; the schema declares it optional, so the filter stays
-          # valid there and simply matches none of them.
+          # Meilisearch's `OR preorder = true` keep it.
           conditions << "(available_on_i:<=#{now.to_i} || preorder:=true)"
           # 0 is the sentinel for "never discontinued"; a future timestamp
           # means discontinued LATER, so those products must still be
@@ -76,20 +74,16 @@ module Spree
           when 'in_categories'
             ids = valid_ids(value)
             "category_ids:=[#{ids.join(',')}]" if ids.any?
-          # Spree 6.0 whitelists in_collection and its Database provider
-          # applies it; 5.x has no collections, and documents built there carry
-          # no collection_ids. Membership only: manual (position) sort within a
-          # collection needs membership documents, which this gem does not emit.
           when 'in_collection'
-            "collection_ids:=#{sanitize_id(value)}" if SpreeTypesense.spree_6? && valid_id?(value)
+            "collection_ids:=#{sanitize_id(value)}" if valid_id?(value)
           when 'with_option_value_ids'
             nil # handled by grouped_option_conditions
-          # The records the filters endpoint passes on a category or (Spree 6)
-          # collection page, so facets and the total cover that grouping only.
+          # The records the filters endpoint passes on a category or collection
+          # page, so facets and the total cover that grouping only.
           when '_category'
             grouping_condition('category_ids', value)
           when '_collection'
-            grouping_condition('collection_ids', value) if SpreeTypesense.spree_6?
+            grouping_condition('collection_ids', value)
           end
         end
 
@@ -106,10 +100,10 @@ module Spree
         # The conditions a selection of option values (grouped by option type)
         # adds, and whether they answer it exactly. Values of one type are a
         # union, which the index answers. Values of several types must sit on
-        # one variant (core's `with_option_value_ids` on Spree 6): there the
-        # condition asks for any token over the cartesian product of the
-        # selected values. Otherwise, and on 5.x (which decides it on the
-        # product), the per-type conditions are only a pre-filter.
+        # one variant (core's `with_option_value_ids`): there the condition
+        # asks for any token over the cartesian product of the selected values.
+        # Beyond what the tokens cover, the per-type conditions are only a
+        # pre-filter.
         #
         # @param grouped [Hash{Object => Array<String>}] prefixed ids by option type
         # @return [Array(Array<String>, Boolean)] conditions, exact
@@ -119,7 +113,6 @@ module Spree
 
           per_type = grouped_option_conditions(grouped)
           return [per_type, true] if axes.size == 1
-          return [per_type, false] unless SpreeTypesense.spree_6?
           return [per_type, false] if axes.size > MAX_COMBINATION_AXES
           return [per_type, false] if axes.map(&:size).reduce(:*) > MAX_COMBINATION_TOKENS
 
@@ -137,14 +130,14 @@ module Spree
           end
         end
 
-        # The Typesense sort for the API's sort param. On Spree 6, a listing of
-        # one collection or category in the merchant's order ('manual', or no
-        # sort there, whatever the text query, as core's Database provider
-        # decides) sorts by the product's position in it; the collection wins
-        # when both are given, as in core's `manual_sort_grouping`. 'manual'
-        # with no single grouping, and 5.x, keep the default ranking.
+        # The Typesense sort for the API's sort param. A listing of one
+        # collection or category in the merchant's order ('manual', or no sort
+        # there, whatever the text query, as core's Database provider decides)
+        # sorts by the product's position in it; the collection wins when both
+        # are given, as in core's `manual_sort_grouping`. 'manual' with no
+        # single grouping keeps the default ranking.
         def sort_by(sort_param, filters = {})
-          if SpreeTypesense.spree_6? && (sort_param.blank? || sort_param.to_s == 'manual')
+          if sort_param.blank? || sort_param.to_s == 'manual'
             grouping = manual_grouping(filters)
             return "pos_#{grouping}:asc" if grouping
           end

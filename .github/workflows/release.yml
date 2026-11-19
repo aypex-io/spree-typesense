@@ -4,9 +4,9 @@
 # identity token and RubyGems.org exchanges it for a push-scoped credential.
 #
 # Requires a trusted publisher registered on RubyGems.org for this gem with:
-#   gem name    spree_typesense
+#   gem name    spree-typesense
 #   owner       aypex-io
-#   repository  spree_typesense
+#   repository  spree-typesense
 #   workflow    release.yml
 #   environment release
 #

@@ -75,9 +75,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
       end
     end
 
-    # Core 5.x's FiltersAggregator defaults a category page to the
-    # category's own sort order (`to_api_sort(@category&.sort_order ||
-    # 'manual')`). Spree 6 categories are manual only.
+    # Spree 6 categories are manual only: a category page starts on
+    # 'manual', whatever sort order a category migrated from 5.x carries.
     describe 'on a category page' do
       def category(sort_order) = Struct.new(:sort_order, :prefixed_id).new(sort_order, 'ctg_tea')
 
@@ -85,15 +84,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
         provider.filters(scope: FakeScope.new([]), filters: { '_category' => category(sort_order) }).default_sort
       end
 
-      context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-        { 'price desc' => '-price', 'name asc' => 'name', nil => 'manual' }.each do |sort_order, api_sort|
-          it "defaults a category sorted #{sort_order.inspect} to #{api_sort.inspect}" do
-            expect(default_for(sort_order)).to eq(api_sort)
-          end
-        end
-      end
-
-      context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+      context 'on Spree 6.x' do
         it "ignores the category's sort order" do
           expect(default_for('price desc')).to eq('manual')
         end
@@ -120,7 +111,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
     def search(**args) = provider.search_and_filter(scope: scope, page: 2, limit: 10, **args)
     def sort_sent = client.searches.sole[:sort_by]
 
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    context 'on Spree 6.x' do
       [
         [{ 'in_category' => 'ctg_a' }, nil, 'pos_ctg_a:asc'],
         [{ 'in_category' => 'ctg_a' }, '', 'pos_ctg_a:asc'],
@@ -163,15 +154,6 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
         expect(sort_sent).to eq(sort_by)
       end
     end
-
-    # Spree 5 documents carry no positions, as core 5.x's did not.
-    context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-      it "keeps Typesense's ranking for a category listing" do
-        search(filters: { 'in_category' => 'ctg_a' })
-
-        expect(sort_sent).to be_nil
-      end
-    end
   end
 end
 
@@ -202,28 +184,9 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests across option 
     provider.search_and_filter(scope: scope, filters: { 'with_option_value_ids' => grouped.values.flatten })
   end
 
-  context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-    it 'narrows the scope through core when values of two option types are selected' do
-      allow(scope).to receive(:with_option_value_ids).and_return(FakeScope.new(%w[prod_2]))
-
-      result = search(1 => %w[ov_blue], 2 => %w[ov_xl ov_l])
-
-      expect(scope).to have_received(:with_option_value_ids).with(%w[ov_blue ov_xl ov_l])
-      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_2])
-    end
-
-    it 'still asks Typesense for the per-type pre-filter' do
-      allow(scope).to receive(:with_option_value_ids).and_return(scope)
-
-      search(1 => %w[ov_blue], 2 => %w[ov_xl])
-
-      expect(client.searches.sole[:filter_by]).to include('option_value_ids:=ov_blue', 'option_value_ids:=ov_xl')
-    end
-  end
-
   # Spree 6 documents carry one token per combination of a variant's values,
   # so Typesense answers "blue AND XL" exactly: full pages, exact totals (#10).
-  context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+  context 'on Spree 6.x' do
     it 'asks Typesense for the combinations, and leaves the scope alone' do
       allow(scope).to receive(:with_option_value_ids)
 

@@ -2,12 +2,10 @@ module Spree
   module SearchProvider
     class Typesense < Base
       module Schema
-        # Transcribed from SpreeTypesense::ProductPresenter#build_document (a
-        # port of spree_core 5.6.1's, which 6.0 removed from core). Every
-        # supported Spree version emits the same named fields, plus
-        # `collection_ids` on 6.x; only their sources differ. `cf_*` keys are
-        # dynamic and left undeclared — Typesense stores them without indexing
-        # them, so they can be neither searched, filtered nor sorted on.
+        # Transcribed from Spree::Typesense::ProductPresenter#build_document.
+        # `cf_*` keys are dynamic and left undeclared — Typesense stores them
+        # without indexing them, so they can be neither searched, filtered nor
+        # sorted on.
         # Do not add fields the presenter does not emit.
         SEARCHABLE_FIELDS = %w[name description sku option_values category_names tags].freeze
 
@@ -51,12 +49,11 @@ module Spree
 
               { name: 'category_ids',   type: 'string[]', facet: true, optional: true },
               { name: 'category_names', type: 'string[]', facet: false, optional: true },
-              # Spree 6.x only, for the in_collection filter. Typesense filters
-              # on any indexed field, so no facet: collection facets are not
-              # offered. Optional because 5.x documents never carry it.
+              # For the in_collection filter. Typesense filters on any indexed
+              # field, so no facet: collection facets are not offered.
               { name: 'collection_ids', type: 'string[]', facet: false, optional: true },
 
-              # Spree 6.x only: the product's position in each collection and
+              # The product's position in each collection and
               # category it belongs to, `pos_<prefixed id>` (an ancestor
               # category takes the lowest position below it). A manual listing
               # of one grouping sorts by its field. Declared by pattern, so
@@ -66,7 +63,7 @@ module Spree
               { name: 'option_type_ids',   type: 'string[]', facet: false, optional: true },
               { name: 'option_type_names', type: 'string[]', facet: false, optional: true },
               { name: 'option_value_ids',  type: 'string[]', facet: true,  optional: true },
-              # Spree 6.x only: one token per set of 2..6 option values one
+              # One token per set of 2..6 option values one
               # variant carries (`ov_a|ov_b`), so a filter on several option
               # types matches a single variant, as core's scope does.
               { name: 'option_value_combination_ids', type: 'string[]', facet: false, optional: true },
@@ -94,10 +91,6 @@ module Spree
               # cannot drop what the newer one wrote.
               { name: 'indexed_at', type: 'int64', facet: false, optional: true },
 
-              # Not emitted on spree_core 5.5.x, whose products have no
-              # preorder?. Emitted on 5.6+ and 6.x (product.preorder?).
-              # Declared optional so the collection stays valid whichever
-              # version's documents arrive.
               { name: 'preorder', type: 'bool', facet: true, optional: true }
             ]
           }

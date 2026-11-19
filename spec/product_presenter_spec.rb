@@ -1,6 +1,6 @@
 require 'spec_helper'
 
-RSpec.describe SpreeTypesense::ProductPresenter do
+RSpec.describe Spree::Typesense::ProductPresenter do
   let(:us) { FakeCatalog::Market.new(currency: 'USD', supported_locales_list: %w[en], default_locale: 'en') }
   let(:eu) { FakeCatalog::Market.new(currency: 'EUR', supported_locales_list: %w[en de], default_locale: 'en') }
   let(:store) do
@@ -104,73 +104,7 @@ RSpec.describe SpreeTypesense::ProductPresenter do
     expect(document('en', 'USD')[:channel_ids]).to eq(%w[3 4])
   end
 
-  context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-    # The guarantee that 5.x documents are exactly what they were when core's
-    # presenter built them: same product in, same documents out.
-    describe 'parity with spree_core\'s own presenter' do
-      def core_documents(product, store)
-        Spree::SearchProvider::ProductPresenter.new(product, store).call
-      end
-
-      it 'matches for a multi-market, multi-locale product' do
-        expect(documents).to eq(core_documents(product, store))
-      end
-
-      it 'matches for a store without markets' do
-        legacy = FakeCatalog::Store.new(id: 7, code: 'legacy', markets: [], default_market: nil,
-                                        supported_currencies_list: [FakeCatalog::Currency.new('USD')])
-        expect(described_class.new(product, legacy).call).to eq(core_documents(product, legacy))
-      end
-
-      it 'matches for a bare product with no categories, options or custom fields' do
-        bare = FakeCatalog::Product.new(prefixed_id: 'prod_bare', names: { 'en' => 'Bare' }, prices: { 'USD' => 1 })
-        expect(described_class.new(bare, store).call).to eq(core_documents(bare, store))
-      end
-
-      it 'matches key order too, so documents serialise identically' do
-        expect(documents.map(&:keys)).to eq(core_documents(product, store).map(&:keys))
-      end
-    end
-
-    it 'takes categories from taxons, with ancestors, once each' do
-      expect(document('en', 'USD')[:category_ids]).to eq(%w[ctg_apparel ctg_shirts ctg_sale])
-      expect(document('de', 'EUR')[:category_names]).to eq(%w[Hemden Sale])
-    end
-
-    it 'takes option type and value names from presentation' do
-      expect(document('en', 'USD')).to include(
-        option_type_names: ['Colour (presentation)'],
-        option_values: ['Red (presentation)', 'L (presentation)']
-      )
-    end
-
-    it 'keeps the description as stored' do
-      expect(document('en', 'USD')[:description]).to eq('<p>Breathable</p><p>Made <strong>well</strong></p>')
-    end
-
-    it 'emits preorder from 5.6.0, as core does' do
-      expect(document('en', 'USD').key?(:preorder)).to eq(FakeCatalog.since?(FakeCatalog::PREORDER_SINCE))
-    end
-
-    it 'emits searchable or sortable metafields from 5.6.1, as core does, regardless of visibility' do
-      expected = if FakeCatalog.since?(FakeCatalog::METAFIELD_SEARCH_SINCE)
-                   { 'cf_material' => 'Cotton', 'cf_weight' => 250.0, 'cf_supplier_code' => 'SUP-1' }
-                 else
-                   {}
-                 end
-      expect(document('en', 'USD').select { |k, _| k.to_s.start_with?('cf_') }).to eq(expected)
-    end
-
-    it 'emits no collection_ids: 5.x has no collections' do
-      expect(document('en', 'USD')).not_to have_key(:collection_ids)
-    end
-
-    it 'emits no positions, as core 5.x does not' do
-      expect(document('en', 'USD').keys.grep(/\Apos_/)).to eq([])
-    end
-  end
-
-  context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+  context 'on Spree 6.x' do
     it 'takes categories from categories (ctg_ ids), with ancestors, once each' do
       expect(document('en', 'USD')[:category_ids]).to eq(%w[ctg_apparel ctg_shirts ctg_sale])
       expect(document('de', 'EUR')[:category_names]).to eq(%w[Hemden Sale])
@@ -233,7 +167,7 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       expect(document('en', 'USD')[:collection_ids]).to eq(%w[coll_summer coll_linen])
     end
 
-    it 'emits the same field names as on 5.6.1, plus collection_ids and option_value_combination_ids' do
+    it 'emits these field names, in this order' do
       expect(document('en', 'USD').keys.reject { |key| key.to_s.start_with?('pos_') }).to eq(
         %i[id product_id locale currency name description slug price compare_at_price status sku in_stock preorder
            store_ids channel_ids discontinue_on category_ids category_names collection_ids option_type_ids

@@ -1,6 +1,6 @@
 require 'spec_helper'
 
-RSpec.describe SpreeTypesense::CircuitBreaker do
+RSpec.describe Spree::Typesense::CircuitBreaker do
   let(:now) { [1_000.0] }
   let(:breaker) { described_class.new(threshold: 3, open_seconds: 30, clock: -> { now.first }) }
 
