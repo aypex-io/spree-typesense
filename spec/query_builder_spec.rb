@@ -140,19 +140,13 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
       expect(out.first).to eq('category_ids:=[tax_a,tax_b]')
     end
 
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    context 'on Spree 6.x' do
       it 'filters by collection using collection_ids' do
         expect(described_class.user_conditions(in_collection: 'coll_x')).to eq(['collection_ids:=coll_x'])
       end
 
       it 'drops a collection id that is not a well-formed prefixed id' do
         expect(described_class.user_conditions(in_collection: 'coll_x || collection_ids:=coll_y')).to be_empty
-      end
-    end
-
-    context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-      it 'ignores in_collection, as before: 5.x has no collections' do
-        expect(described_class.user_conditions(in_collection: 'coll_x')).to be_empty
       end
     end
 
@@ -170,9 +164,8 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
         expect(described_class.condition_for('_category', 'ctg_tea')).to be_nil
       end
 
-      it 'narrows to the _collection on Spree 6, and ignores it on 5.x' do
-        expected = SpreeTypesense.spree_6? ? 'collection_ids:=coll_new' : nil
-        expect(described_class.condition_for('_collection', record('coll_new'))).to eq(expected)
+      it 'narrows to the _collection' do
+        expect(described_class.condition_for('_collection', record('coll_new'))).to eq('collection_ids:=coll_new')
       end
     end
 
@@ -215,7 +208,7 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
         .to eq([['option_value_ids:=[ov_red,ov_blue]'], true])
     end
 
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    context 'on Spree 6.x' do
       it 'asks for one variant carrying a value of each type, whatever order they were picked in' do
         expect(described_class.option_conditions(1 => %w[ov_b], 2 => %w[ov_a]))
           .to eq([['option_value_combination_ids:=[`ov_a|ov_b`]'], true])
@@ -247,15 +240,6 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
 
         expect(conditions).to eq(described_class.grouped_option_conditions(grouped))
         expect(exact).to be(false)
-      end
-    end
-
-    # 5.x decides "blue AND XL" on the product, as the index holds it, and
-    # its documents carry no combination tokens.
-    context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-      it 'keeps the per-type conditions, narrowed by core' do
-        expect(described_class.option_conditions(1 => %w[ov_b], 2 => %w[ov_a]))
-          .to eq([['option_value_ids:=ov_b', 'option_value_ids:=ov_a'], false])
       end
     end
   end

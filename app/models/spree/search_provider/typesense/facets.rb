@@ -114,9 +114,8 @@ module Spree
 
         # All categories collapse into ONE facet whose id is the literal
         # 'categories' — unlike options, which get one facet per type.
-        # Spree::Category on 6.x: Spree::Taxon there is a deprecated alias.
         def category_facet(distribution)
-          categories = lookup(SpreeTypesense.category_class, distribution.keys)
+          categories = lookup(Spree::Category, distribution.keys)
 
           {
             id: 'categories',

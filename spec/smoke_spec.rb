@@ -1,8 +1,8 @@
 require 'spec_helper'
 
-RSpec.describe SpreeTypesense do
+RSpec.describe Spree::Typesense do
   it 'has a version' do
-    expect(SpreeTypesense::VERSION).to match(/\A\d+\.\d+\.\d+(\.(alpha|beta|rc)\d+)?\z/)
+    expect(Spree::Typesense::VERSION).to match(/\A\d+\.\d+\.\d+(\.(alpha|beta|rc)\d+)?\z/)
   end
 
   it 'can reach the Typesense server' do

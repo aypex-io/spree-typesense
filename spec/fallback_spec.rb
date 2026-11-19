@@ -43,19 +43,9 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter degradation
       )
     end
 
-    context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-      it 'builds the Database provider with the store only, as 5.x providers take' do
-        allow(Spree::SearchProvider::Database).to receive(:new).and_call_original
-
-        provider.search_and_filter(scope: FakeScope.new([]), query: 'x') rescue nil
-
-        expect(Spree::SearchProvider::Database).to have_received(:new).with(store)
-      end
-    end
-
     # A back-office search (audience: nil) must not degrade into a storefront
     # one: 6.x's Database provider scopes its query and ransack by audience.
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    context 'on Spree 6.x' do
       [:store, nil].each do |audience|
         context "with audience: #{audience.inspect}" do
           let(:provider) { described_class.new(store, audience: audience) }
@@ -240,11 +230,11 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
   # for a while and answers from the Database provider at once (#8).
   describe 'the circuit breaker' do
     let(:now) { [1_000.0] }
-    let(:breaker) { SpreeTypesense::CircuitBreaker.new(threshold: 3, open_seconds: 30, clock: -> { now.first }) }
+    let(:breaker) { Spree::Typesense::CircuitBreaker.new(threshold: 3, open_seconds: 30, clock: -> { now.first }) }
     let(:client) { RecordingTypesenseClient.new { raise Typesense::Error::TimeoutError, 'timed out' } }
 
     before do
-      allow(SpreeTypesense::CircuitBreaker).to receive(:for).and_return(breaker)
+      allow(Spree::Typesense::CircuitBreaker).to receive(:for).and_return(breaker)
       allow(provider).to receive(:search_client).and_return(client)
     end
 

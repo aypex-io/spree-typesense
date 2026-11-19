@@ -30,12 +30,10 @@ RSpec.describe Spree::SearchProvider::Typesense::Schema do
     expect(definition[:fields].map { |f| f[:name] }).not_to include('taxon_ids')
   end
 
-  # This is the spree_core 5.5.1 contract (the oldest supported release) plus
-  # preorder (emitted by spree_core 5.6+ but not 5.5.1; declared as an
-  # optional field), collection_ids (6.x only) and the derived
-  # available_on_i. Must stay an EXACT set — match_array, not
-  # include — so an invented field re-added to the schema is caught here,
-  # same as it caught brand/best_selling_score/taxon_ids the first time.
+  # The presenter's fields plus the derived available_on_i and indexed_at.
+  # Must stay an EXACT set — match_array, not include — so an invented field
+  # re-added to the schema is caught here, same as it caught
+  # brand/best_selling_score/taxon_ids the first time.
   it 'declares every field the presenter emits' do
     expected = %w[
       product_id locale currency name description slug price compare_at_price
@@ -77,11 +75,9 @@ RSpec.describe Spree::SearchProvider::Typesense::Schema do
     expect(names).not_to include('brand', 'best_selling_score', 'taxon_ids')
   end
 
-  # spree_core 5.5.1 (the oldest supported release) does not emit `preorder`
-  # — that only appears in 5.6+. Optional, so one collection takes documents
-  # from either, and searches can filter on it (`preorder:=true`) whether or
-  # not a document carries it.
-  it 'declares preorder as an optional, facetable bool for 5.6 forward-compat' do
+  # Optional, so searches can filter on it (`preorder:=true`) whether or not
+  # a document carries it.
+  it 'declares preorder as an optional, facetable bool' do
     expect(field('preorder')[:type]).to eq('bool')
     expect(field('preorder')[:optional]).to be(true)
     expect(field('preorder')[:facet]).to be(true)

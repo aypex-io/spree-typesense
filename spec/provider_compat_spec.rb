@@ -1,6 +1,6 @@
 require 'spec_helper'
 
-RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
+RSpec.describe Spree::SearchProvider::Typesense, 'wiring into Spree' do
   let(:store) { instance_double('Spree::Store', id: 1, code: 'compat') }
 
   # A fresh Dependencies per example, at core's defaults with nothing
@@ -10,11 +10,11 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
   before { stub_const('Spree::Dependencies', dependencies) }
 
   describe '.new' do
-    it 'takes just a store on every version, as SearchIndexable builds it' do
+    it 'takes just a store, as SearchIndexable builds it' do
       expect(described_class.new(store).store).to eq(store)
     end
 
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    context 'on Spree 6.x' do
       it 'defaults the audience to :store, as Base does' do
         expect(described_class.new(store).audience).to eq(:store)
       end
@@ -40,11 +40,11 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
     let(:provider) { described_class.new(store) }
 
     it "is the gem's own presenter when the application set none" do
-      expect(provider.send(:presenter_class)).to be(SpreeTypesense::ProductPresenter)
+      expect(provider.send(:presenter_class)).to be(Spree::Typesense::ProductPresenter)
     end
 
     it "is the application's presenter when it set one" do
-      app_presenter = Class.new(SpreeTypesense::ProductPresenter)
+      app_presenter = Class.new(Spree::Typesense::ProductPresenter)
       dependencies.search_product_presenter = app_presenter
 
       expect(provider.send(:presenter_class)).to be(app_presenter)
@@ -52,9 +52,9 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
 
     it "is the gem's own presenter after the engine registered it" do
       allow(Spree).to receive(:search_provider).and_return('Spree::SearchProvider::Typesense')
-      SpreeTypesense.register_search_product_presenter!
+      Spree::Typesense.register_search_product_presenter!
 
-      expect(provider.send(:presenter_class)).to be(SpreeTypesense::ProductPresenter)
+      expect(provider.send(:presenter_class)).to be(Spree::Typesense::ProductPresenter)
     end
 
     # The setting is shared with any other search gem, such as
@@ -63,52 +63,38 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
       other_presenter = Class.new
       dependencies.search_product_presenter = other_presenter
 
-      expect(provider.send(:presenter_class)).to be(SpreeTypesense::ProductPresenter)
+      expect(provider.send(:presenter_class)).to be(Spree::Typesense::ProductPresenter)
     end
   end
 
-  # Asked per document and per option value while reindexing.
-  describe 'SpreeTypesense.spree_6?' do
-    it 'parses the Spree version once, not on every call' do
-      SpreeTypesense.spree_6?
-      allow(Spree).to receive(:version).and_call_original
-      allow(Gem::Version).to receive(:new).and_call_original
-
-      3.times { SpreeTypesense.spree_6? }
-
-      expect(Spree).not_to have_received(:version)
-      expect(Gem::Version).not_to have_received(:new)
-    end
-  end
-
-  describe 'SpreeTypesense.register_search_product_presenter!' do
+  describe 'Spree::Typesense.register_search_product_presenter!' do
     before { allow(Spree).to receive(:search_provider).and_return('Spree::SearchProvider::Typesense') }
 
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    context 'on Spree 6.x' do
       it 'starts from core shipping no presenter' do
         expect(dependencies.search_product_presenter).to be_nil
       end
 
       it "registers the gem's presenter when the application set none" do
-        SpreeTypesense.register_search_product_presenter!
+        Spree::Typesense.register_search_product_presenter!
 
-        expect(dependencies.search_product_presenter).to eq('SpreeTypesense::ProductPresenter')
-        expect(dependencies.search_product_presenter_class).to be(SpreeTypesense::ProductPresenter)
+        expect(dependencies.search_product_presenter).to eq('Spree::Typesense::ProductPresenter')
+        expect(dependencies.search_product_presenter_class).to be(Spree::Typesense::ProductPresenter)
       end
 
       it 'registers it when a subclass of the Typesense provider is selected' do
         stub_const('MyApp::SearchProvider', Class.new(described_class))
         allow(Spree).to receive(:search_provider).and_return('MyApp::SearchProvider')
 
-        SpreeTypesense.register_search_product_presenter!
+        Spree::Typesense.register_search_product_presenter!
 
-        expect(dependencies.search_product_presenter).to eq('SpreeTypesense::ProductPresenter')
+        expect(dependencies.search_product_presenter).to eq('Spree::Typesense::ProductPresenter')
       end
 
       it "leaves the application's own presenter alone" do
         dependencies.search_product_presenter = 'MyApp::ProductPresenter'
 
-        SpreeTypesense.register_search_product_presenter!
+        Spree::Typesense.register_search_product_presenter!
 
         expect(dependencies.search_product_presenter).to eq('MyApp::ProductPresenter')
       end
@@ -116,7 +102,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
       it "leaves another search gem's registration alone" do
         dependencies.search_product_presenter = 'SpreeMeilisearch::ProductPresenter'
 
-        SpreeTypesense.register_search_product_presenter!
+        Spree::Typesense.register_search_product_presenter!
 
         expect(dependencies.search_product_presenter).to eq('SpreeMeilisearch::ProductPresenter')
       end
@@ -126,26 +112,20 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
       it 'registers nothing when another search provider is selected' do
         allow(Spree).to receive(:search_provider).and_return('Spree::SearchProvider::Database')
 
-        SpreeTypesense.register_search_product_presenter!
+        Spree::Typesense.register_search_product_presenter!
 
         expect(dependencies.overridden?(:search_product_presenter)).to be(false)
         expect(dependencies.search_product_presenter).to be_nil
       end
     end
 
-    context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-      it "does nothing: core's default stays, and the provider indexes with the gem's presenter regardless" do
-        expect { SpreeTypesense.register_search_product_presenter! }
-          .not_to(change { [dependencies.search_product_presenter, dependencies.overridden?(:search_product_presenter)] })
-      end
-    end
   end
 
   # spec_helper makes every Spree deprecation raise, so the whole suite already
   # fails on one. This walks the gem's full surface in one place, and watches
   # Spree::Deprecation directly too, so the guarantee does not rest on that
   # global setting alone.
-  describe 'Spree deprecations', if: SpreeTypesense.spree_6? do
+  describe 'Spree deprecations' do
     let(:provider) { described_class.new(store) }
     let(:collection) { provider.client.collections[provider.collection_name] }
     let(:shirts) do
@@ -173,7 +153,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
     end
 
     it 'are never triggered by registering, indexing, searching, filtering or faceting' do
-      SpreeTypesense.register_search_product_presenter!
+      Spree::Typesense.register_search_product_presenter!
       bootstrap_index!(provider)
       provider.index_batch(provider.send(:presenter_class).new(product, presenter_store).call)
 
@@ -185,9 +165,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
       expect(Spree::Deprecation).not_to have_received(:warn)
     end
 
-    it 'leaves Spree::Taxon unreferenced: the suite never defines it on 6.x' do
+    it 'leaves Spree::Taxon unreferenced: the suite never defines it' do
       expect(Spree.const_defined?(:Taxon, false)).to be(false)
-      expect(SpreeTypesense.category_class).to be(Spree::Category)
     end
   end
 end

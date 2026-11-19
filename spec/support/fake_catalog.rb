@@ -9,10 +9,9 @@
 # current Mobility locale, or for `locale:` when given — the two calls the
 # presenters' `translated` helper makes.
 #
-# The 5.x names Spree 6.0 deprecated (#taxons, #variants_including_master,
-# #metafields) warn through Spree::Deprecation on 6.x exactly as core does,
-# and the suite raises on any deprecation, so a presenter reaching for them on
-# 6.x fails.
+# The names Spree 6.0 deprecated (#taxons, #variants_including_master,
+# #metafields) warn through Spree::Deprecation exactly as core does, and the
+# suite raises on any deprecation, so a presenter reaching for them fails.
 module FakeCatalog
   module Translated
     private
@@ -23,24 +22,13 @@ module FakeCatalog
       values[(locale || Mobility.locale).to_s]
     end
 
-    def deprecated_on_spree_6(message)
-      Spree::Deprecation.warn(message) if SpreeTypesense.spree_6?
+    def deprecated(message)
+      Spree::Deprecation.warn(message)
     end
   end
 
-  # The spree_core release whose models gained what the presenter checks for
-  # with `respond_to?`. The fakes answer those calls from the same release, so
-  # they look like core's models for the version under test. Core's own
-  # presenter is the check on both: on 5.6.1 it calls `preorder?` and
-  # `searchable?`, and on 5.5.1 our presenter would emit what core's does not,
-  # so the parity spec fails if either boundary is wrong.
-  PREORDER_SINCE = Gem::Version.new('5.6.0')
-  METAFIELD_SEARCH_SINCE = Gem::Version.new('5.6.1')
-
-  def self.since?(version) = SpreeTypesense.spree_version >= version
-
-  # A taxon on 5.x, a category on 6.x. `names` is a plain name, or translations
-  # for the presenter; `id` and `permalink` are what the category facet reads.
+  # A category. `names` is a plain name, or translations for the presenter;
+  # `id` and `permalink` are what the category facet reads.
   Category = Struct.new(:id, :prefixed_id, :names, :permalink, :parent, keyword_init: true) do
     include Translated
 
@@ -48,9 +36,9 @@ module FakeCatalog
     def self_and_ancestors = [*parent&.self_and_ancestors, self]
   end
 
-  # An option type or an option value: the presenter reads the same two names
-  # off both. `presentation` is the 5.x name, `label` the 6.0 one. Fakes carry
-  # different values in each so a presenter reading the wrong one is caught.
+  # An option type or an option value: the presenter reads `label` off both.
+  # `presentation` is the name Spree 6.0 renamed; fakes carry different values
+  # in each so a presenter reading the old one is caught.
   Option = Struct.new(:prefixed_id, :presentations, :labels, keyword_init: true) do
     include Translated
 
@@ -73,16 +61,13 @@ module FakeCatalog
 
   CustomFieldDefinition = Struct.new(:filter_key, :field_type, :searchable, :sortable, :storefront_visible,
                                      keyword_init: true) do
-    # Metafield definitions before 5.6.1 have no search capabilities.
-    if FakeCatalog.since?(METAFIELD_SEARCH_SINCE)
-      def searchable? = !!searchable
-      def sortable? = !!sortable
-    end
+    def searchable? = !!searchable
+    def sortable? = !!sortable
 
     def storefront_visible? = !!storefront_visible
   end
 
-  # A Spree::Metafield on 5.x, a Spree::CustomField on 6.0.
+  # A Spree::CustomField (`metafield_definition` is its deprecated 5.x name).
   CustomField = Struct.new(:definition, :value, keyword_init: true) do
     def custom_field_definition = definition
     def metafield_definition = definition
@@ -159,36 +144,30 @@ module FakeCatalog
 
     def in_stock? = @in_stock
 
-    # Spree 5.5 products have no preorder?.
-    if FakeCatalog.since?(PREORDER_SINCE)
-      def preorder? = @preorder
-    end
+    def preorder? = @preorder
 
     def categories = @categories
     def variants = @variants
     def custom_fields = @custom_fields
 
-    # Collections, and the memberships Spree 6 orders groupings by, are new
-    # in Spree 6.0. `positions` maps a grouping's prefixed id to the
-    # product's position in it.
-    if SpreeTypesense.spree_6?
-      def collections = @collections
-      def product_collections = @collections.map { |c| Membership.new(c, @positions[c.prefixed_id]) }
-      def product_categories = @categories.map { |c| Membership.new(c, @positions[c.prefixed_id]) }
-    end
+    # Collections, and the memberships groupings are ordered by. `positions`
+    # maps a grouping's prefixed id to the product's position in it.
+    def collections = @collections
+    def product_collections = @collections.map { |c| Membership.new(c, @positions[c.prefixed_id]) }
+    def product_categories = @categories.map { |c| Membership.new(c, @positions[c.prefixed_id]) }
 
     def taxons
-      deprecated_on_spree_6('Spree::Product#taxons is deprecated and will be removed in Spree 6.1. Use #categories instead.')
+      deprecated('Spree::Product#taxons is deprecated and will be removed in Spree 6.1. Use #categories instead.')
       @categories
     end
 
     def variants_including_master
-      deprecated_on_spree_6('Spree::Product#variants_including_master is deprecated and will be removed in Spree 6.1. Use #variants instead.')
+      deprecated('Spree::Product#variants_including_master is deprecated and will be removed in Spree 6.1. Use #variants instead.')
       [@master, *@variants]
     end
 
     def metafields
-      deprecated_on_spree_6('Spree::Product#metafields is deprecated. Use #custom_fields instead.')
+      deprecated('Spree::Product#metafields is deprecated. Use #custom_fields instead.')
       @custom_fields
     end
   end

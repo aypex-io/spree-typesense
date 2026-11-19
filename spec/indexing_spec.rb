@@ -99,7 +99,7 @@ RSpec.describe Spree::SearchProvider::Typesense do
 
     # The upgrade path the README prescribes: bump, reindex, and a collection
     # listing filters again instead of failing on an unknown field.
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    context 'on Spree 6.x' do
       it 'serves an in_collection listing after the reindex adds the field' do
         create_collection_as_0_1_did
         allow(provider).to receive(:locale).and_return('en')
@@ -148,7 +148,7 @@ RSpec.describe Spree::SearchProvider::Typesense do
   it 'indexes a product by delegating to the configured presenter' do
     product = FakeProduct.new('prod_c')
     presenter = instance_double(
-      SpreeTypesense::ProductPresenter,
+      Spree::Typesense::ProductPresenter,
       call: [
         { 'id' => 'prod_c_en_USD', 'product_id' => 'prod_c', 'locale' => 'en',
           'currency' => 'USD', 'status' => 'active', 'name' => 'Delegated',
@@ -157,7 +157,7 @@ RSpec.describe Spree::SearchProvider::Typesense do
           'created_at' => '2024-01-01T00:00:00Z' }
       ]
     )
-    presenter_class = class_double('SpreeTypesense::ProductPresenter', new: presenter)
+    presenter_class = class_double('Spree::Typesense::ProductPresenter', new: presenter)
     allow(provider).to receive(:presenter_class).and_return(presenter_class)
 
     provider.index(product)
@@ -202,8 +202,8 @@ RSpec.describe Spree::SearchProvider::Typesense do
     end
 
     def present(product_id, documents)
-      presenter_class = class_double('SpreeTypesense::ProductPresenter')
-      allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: documents) }
+      presenter_class = class_double('Spree::Typesense::ProductPresenter')
+      allow(presenter_class).to receive(:new) { instance_double(Spree::Typesense::ProductPresenter, call: documents) }
       allow(provider).to receive(:presenter_class).and_return(presenter_class)
       provider.index(FakeProduct.new(product_id))
     end
@@ -252,8 +252,8 @@ RSpec.describe Spree::SearchProvider::Typesense do
 
     # Runs one index job that read the product at `read_at`.
     def job(read_at, documents)
-      presenter_class = class_double('SpreeTypesense::ProductPresenter')
-      allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: documents) }
+      presenter_class = class_double('Spree::Typesense::ProductPresenter')
+      allow(presenter_class).to receive(:new) { instance_double(Spree::Typesense::ProductPresenter, call: documents) }
       allow(provider).to receive(:presenter_class).and_return(presenter_class)
       allow(provider).to receive(:current_time_ms).and_return(read_at)
       provider.index(FakeProduct.new('prod_j'))
@@ -348,8 +348,8 @@ RSpec.describe Spree::SearchProvider::Typesense do
     end
 
     def index_as(product_id, documents)
-      presenter_class = class_double('SpreeTypesense::ProductPresenter')
-      allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: documents) }
+      presenter_class = class_double('Spree::Typesense::ProductPresenter')
+      allow(presenter_class).to receive(:new) { instance_double(Spree::Typesense::ProductPresenter, call: documents) }
       allow(provider).to receive(:presenter_class).and_return(presenter_class)
       provider.index(FakeProduct.new(product_id))
     end
@@ -626,8 +626,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
     before { allow(provider).to receive(:current_time_ms).and_return(1_800_000_000_000) }
 
     def index_producing(product_id, produced)
-      presenter_class = class_double('SpreeTypesense::ProductPresenter')
-      allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: produced) }
+      presenter_class = class_double('Spree::Typesense::ProductPresenter')
+      allow(presenter_class).to receive(:new) { instance_double(Spree::Typesense::ProductPresenter, call: produced) }
       allow(provider).to receive(:presenter_class).and_return(presenter_class)
       provider.index(FakeProduct.new(product_id))
     end

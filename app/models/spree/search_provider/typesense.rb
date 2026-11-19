@@ -78,14 +78,10 @@ module Spree
       # (QueryBuilder.sort_by).
       AVAILABLE_SORT_OPTIONS = %w[manual price -price name -name -available_on available_on best_selling].freeze
 
-      # Spree 5.6's Spree::Api::V3::ProductFilterSortOptionSerializer declares
+      # Spree's Spree::Api::V3::ProductFilterSortOptionSerializer declares
       # `attributes :id, :label` and raises KeyError when :label is absent.
-      # Spree 5.5 only read :id, so the extra key is harmless there — this one
-      # shape satisfies both, and 6.0 reads the same keys, which the gemspec
-      # range (>= 5.5, < 6.1) requires.
       #
-      # NOTE: 5.6 also appends metafield-driven sort options
-      # (`metafield_schema.sort_options`), and 6.0 custom-field ones
+      # NOTE: core also appends custom-field sort options
       # (`custom_field_schema.sort_options`). We do not yet surface those, so a
       # store using custom-field sorts will not see them under this provider.
       def sort_options_payload
@@ -263,12 +259,11 @@ module Spree
         raw_ids = product_ids.filter_map { |pid| Spree::Product.decode_prefixed_id(pid) }
 
         # Values of two or more option types must sit on ONE variant, as core's
-        # `Product.with_option_value_ids` decides on Spree 6. Spree 6 documents
-        # carry combination tokens that answer it exactly. Where they cannot
-        # (more types than the tokens cover) and on 5.x (which asks it of the
-        # product, as the index does), the index only pre-filters and core's
-        # scope gives the exact answer, so a page can come back short of
-        # `limit` and the total over-count.
+        # `Product.with_option_value_ids` decides. Documents carry combination
+        # tokens that answer it exactly. Where they cannot (more types than the
+        # tokens cover), the index only pre-filters and core's scope gives the
+        # exact answer, so a page can come back short of `limit` and the total
+        # over-count.
         scope = scope.with_option_value_ids(grouped.values.flatten) unless exact
 
         # SECURITY: intersect with the authorized scope, preserving engine order.
@@ -654,14 +649,11 @@ module Spree
       end
 
       # The sort a listing starts on, as core's FiltersAggregator derives it:
-      # the collection's own sort order on Spree 6 (only 6.x passes
-      # `_collection`; its categories are manual only), the category's on
-      # Spree 5.x, given in the API's form ('price desc' -> '-price'), and
-      # 'manual' otherwise.
+      # the collection's own sort order (categories are manual only), given in
+      # the API's form ('price desc' -> '-price'), and 'manual' otherwise.
       def default_sort_for(filters)
-        f = normalize_filters(filters)
-        grouping = f['_collection'] || (f['_category'] unless SpreeTypesense.spree_6?)
-        sort_order = grouping.sort_order.presence if grouping.respond_to?(:sort_order)
+        collection = normalize_filters(filters)['_collection']
+        sort_order = collection.sort_order.presence if collection.respond_to?(:sort_order)
         field, direction = (sort_order || DEFAULT_SORT).to_s.split(' ', 2)
         direction == 'desc' ? "-#{field}" : field
       end
@@ -735,7 +727,7 @@ module Spree
                                                       context: { collection: collection_name })
       end
 
-      def circuit_breaker = SpreeTypesense::CircuitBreaker.for(ENV.fetch('TYPESENSE_URL', ''))
+      def circuit_breaker = Spree::Typesense::CircuitBreaker.for(ENV.fetch('TYPESENSE_URL', ''))
 
       # Runs a Typesense request, raising Unavailable in place of any failure
       # in UNAVAILABLE_ERRORS. Wrap only the request itself: whatever the block
@@ -878,32 +870,23 @@ module Spree
         Pagy::Offset.new(count: count, page: page, limit: limit)
       end
 
-      # On 6.x the Database provider takes the same `audience:` as this one, and
-      # uses it for its query and ransack authorisation, so a back-office search
-      # (audience: nil) must not degrade into a storefront one. 5.x providers
-      # take the store only.
+      # The Database provider takes the same `audience:` as this one, and uses
+      # it for its query and ransack authorisation, so a back-office search
+      # (audience: nil) must not degrade into a storefront one.
       def fallback_provider
-        if SpreeTypesense.spree_6?
-          Spree::SearchProvider::Database.new(store, audience: audience)
-        else
-          Spree::SearchProvider::Database.new(store)
-        end
+        Spree::SearchProvider::Database.new(store, audience: audience)
       end
 
-      # The gem's own presenter on every version, unless the application named
-      # a subclass of it. 6.0 core configures none (`search_product_presenter:
-      # nil`), and on 5.x core's default would tie the documents to whichever
-      # presenter core shipped. `overridden?` tells an application's choice
-      # apart from core's default without referencing core's 5.x presenter
-      # constant, which on 6.0 goes through a deprecation shim. On 6.x the
-      # engine registers ours, which also counts as overridden.
+      # The gem's own presenter, unless the application named a subclass of
+      # it. Core configures none (`search_product_presenter: nil`); the engine
+      # registers ours, which counts as overridden.
       #
       # The setting is shared by every installed search gem, so anything that is
       # not ours is ignored: with spree_meilisearch installed it may hold
       # Meilisearch's presenter, whose documents this schema does not describe.
       def presenter_class
         configured = Spree::Dependencies.search_product_presenter_class if Spree::Dependencies.overridden?(:search_product_presenter)
-        configured.is_a?(Class) && configured <= SpreeTypesense::ProductPresenter ? configured : SpreeTypesense::ProductPresenter
+        configured.is_a?(Class) && configured <= Spree::Typesense::ProductPresenter ? configured : Spree::Typesense::ProductPresenter
       end
 
       # `remove_by_id` is public and reached via Spree's RemoveJob (ActiveJob
