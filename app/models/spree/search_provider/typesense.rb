@@ -103,14 +103,13 @@ module Spree
         true
       end
 
-      # Creates the collection, or brings an existing one up to
-      # Schema.definition. Called by #reindex, so the plain
-      # `rake spree:search:reindex` an upgrade runs is enough to add the
-      # fields a newer release declares.
+      # Brings the collection the live name serves from up to
+      # Schema.definition in place, adding the fields it lacks. With no index
+      # at all it does nothing: only #reindex creates one, so a store never
+      # serves an index that holds part of its catalogue without falling back.
       def ensure_index_settings!
-        client.collections.create(Schema.definition(collection_name))
-      rescue ::Typesense::Error::ObjectAlreadyExists
-        update_collection_schema!
+        name = live_collection_name
+        update_collection_schema!(name) if name
         nil
       end
 
@@ -119,38 +118,42 @@ module Spree
       # lazy-preloaded associations. Returns the number of DOCUMENTS indexed
       # (not products — one product can emit N locale x currency documents).
       #
+      # Builds a fresh versioned collection from Schema.definition, marked
+      # `__building` while it fills so single-product writes reach it too,
+      # then points the live alias at it and drops what it replaced: the
+      # older versioned collections and a real collection holding the live
+      # name (0.2.0's, or one a rollback to 0.2.0 created). Searches answer
+      # from the previous collection until the swap, and documents of
+      # products that are gone or out of scope go with the old collection.
+      #
       # A batch with rejected documents does not stop the reindex, and those
       # documents are not counted. Once every batch is sent, an ImportError
-      # names them all, so `rake spree:search:reindex` fails visibly.
-      #
-      # Documents of products deleted since the last reindex are not removed
-      # here: Spree's removal job deletes them as products are destroyed.
+      # names them all, so `rake spree:search:reindex` fails visibly; the new
+      # collection is then dropped and the live alias left where it was, so
+      # no product goes missing from search. Any other error does the same.
       def reindex(scope = nil)
         scope ||= store.products
-        ensure_index_settings!
+        layout = index_layout
+        building = layout.new_version_name(current_time_ms)
+        client.collections.create(Schema.definition(building))
+        layout.point!(layout.building_name, building)
 
-        indexed = 0
-        failures = []
-        scope.reorder(id: :asc).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
-          documents = batch.flat_map { |product| presenter_class.new(product, store).call }
-          next if documents.empty?
-
-          accepted = documents.size
-          begin
-            index_batch(documents)
-          rescue ImportError => e
-            failures.concat(e.failures)
-            accepted -= e.failures.size
-          end
-          indexed += accepted
-          Rails.logger.info { "[spree_typesense] indexed #{accepted} (#{indexed} total) into #{collection_name}" }
+        begin
+          indexed, failures = index_scope(scope, into: building)
+        rescue StandardError
+          abandon_build(layout, building)
+          raise
         end
 
         Rails.logger.info do
           "[spree_typesense] reindex complete: #{indexed} documents indexed, #{failures.size} failed"
         end
-        raise ImportError.new(collection_name, failures) if failures.any?
+        if failures.any?
+          abandon_build(layout, building)
+          raise ImportError.new(building, failures)
+        end
 
+        swap_live_alias(layout, building)
         indexed
       end
 
@@ -159,19 +162,26 @@ module Spree
       # and a product that lost a currency's price, say, must not stay
       # searchable in that market. A product that produces none loses them all.
       #
+      # Writes to the live collection and, while a reindex is filling one, to
+      # that one too, so the change survives the swap. A collection being
+      # built that has since gone (its reindex died) is skipped.
+      #
       # Raises ImportError (after the deletion) when Typesense rejects a
       # document, so the index job retries it.
       def index(product)
         documents = Array(presenter_class.new(product, store).call)
 
+        results = nil
         rejected = nil
-        begin
-          results = index_batch(documents)
-        rescue ImportError => e
-          rejected = e
+        each_write_target do |target, live|
+          begin
+            batch_results = index_batch(documents, into: target)
+            results = batch_results if live
+          rescue ImportError => e
+            rejected ||= e
+          end
+          remove_stale_documents(product.prefixed_id, documents, from: target)
         end
-
-        remove_stale_documents(product.prefixed_id, documents)
         raise rejected if rejected
 
         results
@@ -182,16 +192,18 @@ module Spree
       # rejection is logged with its document id, and once the whole batch is
       # sent an ImportError names them all.
       #
+      # @param documents [Array<Hash>]
+      # @param into [String] the collection or alias to import into
       # @return [Array<Hash>, nil] Typesense's per-document results
       # @raise [ImportError] when Typesense rejected any document
-      def index_batch(documents)
+      def index_batch(documents, into: collection_name)
         return if documents.blank?
 
         documents = documents.map { |d| derive_fields(d) }
-        results = client.collections[collection_name].documents.import(documents, action: 'upsert')
+        results = client.collections[into].documents.import(documents, action: 'upsert')
 
-        failures = import_failures(documents, results)
-        raise ImportError.new(collection_name, failures) if failures.any?
+        failures = import_failures(documents, results, into)
+        raise ImportError.new(into, failures) if failures.any?
 
         results
       end
@@ -280,12 +292,12 @@ module Spree
       end
 
       # Composite ids mean one product maps to N documents (locale × currency),
-      # so delete by filter on product_id rather than by document id.
+      # so delete by filter on product_id rather than by document id. From the
+      # live collection and any collection a reindex is filling.
       def remove_by_id(prefixed_id)
-        client.collections[collection_name]
-              .documents
-              .delete(filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)}")
-      rescue ::Typesense::Error::ObjectNotFound
+        each_write_target do |target, _live|
+          delete_product_documents(prefixed_id, from: target)
+        end
         nil
       end
 
@@ -304,46 +316,144 @@ module Spree
         @search_client ||= build_client(connection_timeout_seconds: search_timeout_seconds, num_retries: 0)
       end
 
+      # The live name searches and writes go through: since 0.3.0 an alias
+      # over the versioned collection the last reindex built (see
+      # IndexLayout).
       def collection_name
         @collection_name ||= "products_#{store.code}"
       end
 
       private
 
+      # Where this store's collections and aliases live.
+      def index_layout
+        @index_layout ||= IndexLayout.new(client, store.code)
+      end
+
+      def current_time_ms = Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond)
+
+      # The collection the live name serves from: a real collection holding
+      # the name, which takes requests ahead of an alias, else the alias's
+      # target. Nil when there is no index.
+      def live_collection_name
+        layout = index_layout
+        layout.legacy_collection? ? layout.live_name : layout.alias_target(layout.live_name)
+      end
+
+      # Yields each collection a single product's write goes to, and whether
+      # it is the live one. A collection being built that is gone is skipped:
+      # its reindex died, and the next one replaces it.
+      def each_write_target
+        index_layout.write_targets.each_with_index do |target, position|
+          live = position.zero?
+          begin
+            yield target, live
+          rescue ::Typesense::Error::ObjectNotFound
+            raise if live
+
+            Rails.logger.warn { "[spree_typesense] skipped '#{target}': the collection a reindex was building is gone" }
+          end
+        end
+      end
+
+      # Indexes the scope in batches into `into`.
+      # @return [Array(Integer, Array<Hash>)] documents accepted, and the rejected ones
+      def index_scope(scope, into:)
+        indexed = 0
+        failures = []
+        scope.reorder(id: :asc).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
+          documents = batch.flat_map { |product| presenter_class.new(product, store).call }
+          next if documents.empty?
+
+          accepted = documents.size
+          begin
+            index_batch(documents, into: into)
+          rescue ImportError => e
+            failures.concat(e.failures)
+            accepted -= e.failures.size
+          end
+          indexed += accepted
+          Rails.logger.info { "[spree_typesense] indexed #{accepted} (#{indexed} total) into #{into}" }
+        end
+        [indexed, failures]
+      end
+
+      # Forgets a reindex's collection: removes the marker and drops it,
+      # leaving the live alias as it was. Best effort, so the error that
+      # stopped the reindex is the one raised.
+      def abandon_build(layout, building)
+        layout.unpoint!(layout.building_name)
+        layout.drop!(building)
+      rescue StandardError => e
+        Rails.logger.error { "[spree_typesense] could not clean up '#{building}': #{e.class}: #{e.message}" }
+      end
+
+      # Points the live alias at the collection just built, then drops what
+      # it replaced. Typesense refuses an alias whose name a collection holds,
+      # so a real collection holding the live name is dropped first; searches
+      # in that moment get a 404 and answer from the Database provider.
+      # Older versioned collections go, newer ones stay: a newer one belongs
+      # to a reindex still running, which will drop this one when it swaps.
+      def swap_live_alias(layout, building)
+        previous = layout.alias_target(layout.live_name)
+        legacy = layout.legacy_collection?
+        layout.drop!(layout.live_name) if legacy
+        layout.point!(layout.live_name, building)
+        layout.unpoint!(layout.building_name)
+
+        replaced = layout.versioned_collections.select { |name| name < building }
+        replaced.each { |name| layout.drop!(name) }
+
+        Rails.logger.info do
+          was = [(layout.live_name if legacy), previous].compact.uniq.join(', ')
+          "[spree_typesense] #{layout.live_name} now serves #{building}" \
+            "#{" (was #{was})" unless was.empty?}; dropped #{replaced.size} older collection(s)" \
+            "#{legacy ? ' and the real collection holding the live name' : ''}"
+        end
+      end
+
       # The rejected documents of an import, logged one by one. A result names
       # its document only when the import asked for that, so fall back to the
       # position: Typesense answers one result per document, in order.
-      def import_failures(documents, results)
+      def import_failures(documents, results, into = collection_name)
         Array(results).each_with_index.filter_map do |result, index|
           next if result['success']
 
           failure = { id: result['id'] || documents.dig(index, 'id'), error: result['error'] }
           Rails.logger.error do
             "[spree_typesense] Typesense rejected document #{failure[:id]} in collection " \
-            "'#{collection_name}': #{failure[:error]}"
+            "'#{into}': #{failure[:error]}"
           end
           failure
         end
       end
 
-      # Deletes the product's documents other than `documents`; all of them
-      # when `documents` is empty. Ids go into the filter quoted in backticks,
-      # Typesense's string literal, because locales such as `en-US` put a
-      # hyphen in them. An id that itself holds a backtick cannot be quoted, so
-      # nothing is deleted then rather than risk deleting the wrong documents.
-      def remove_stale_documents(prefixed_id, documents)
+      # Deletes the product's documents in `from` other than `documents`; all
+      # of them when `documents` is empty. Ids go into the filter quoted in
+      # backticks, Typesense's string literal, because locales such as `en-US`
+      # put a hyphen in them. An id that itself holds a backtick cannot be
+      # quoted, so nothing is deleted then rather than risk deleting the wrong
+      # documents.
+      def remove_stale_documents(prefixed_id, documents, from:)
         kept_ids = documents.map { |d| (d[:id] || d['id']).to_s }
-        return remove_by_id(prefixed_id) if kept_ids.empty?
+        return delete_product_documents(prefixed_id, from: from) if kept_ids.empty?
 
         if kept_ids.any? { |id| id.include?('`') }
           Rails.logger.warn { "[spree_typesense] not removing stale documents of #{prefixed_id}: an id holds a backtick" }
           return
         end
 
-        client.collections[collection_name].documents.delete(
+        client.collections[from].documents.delete(
           filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)} && " \
                      "id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}]"
         )
+      rescue ::Typesense::Error::ObjectNotFound
+        nil
+      end
+
+      # Nothing to remove from a collection that does not exist.
+      def delete_product_documents(prefixed_id, from:)
+        client.collections[from].documents.delete(filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)}")
       rescue ::Typesense::Error::ObjectNotFound
         nil
       end
@@ -556,32 +666,35 @@ module Spree
 
       # Typesense alters a live collection in place: PATCH /collections/:name
       # with the fields to add. Documents already stored keep their values and
-      # gain the new fields when next indexed, which #reindex does straight
-      # after. So a field a release adds reaches an existing collection without
-      # dropping it, and a store keeps serving searches throughout.
+      # gain the new fields when next indexed. So a field a release adds
+      # reaches the collection without dropping it, and the store keeps
+      # serving searches throughout.
       #
       # What Typesense cannot do in place is change a field's type. Never drop
-      # the collection here, which would empty a live index: name the field and
-      # the remedy instead.
+      # the collection here, which would empty a live index: name the field
+      # and the remedy instead. A reindex builds a fresh collection, which has
+      # the declared type.
       #
-      # A failed PATCH raises, so a reindex stops rather than reporting success
+      # A failed PATCH raises, so the caller stops rather than carrying on
       # against a collection that still cannot serve the new filters.
-      def update_collection_schema!
-        live_fields = client.collections[collection_name].retrieve['fields']
+      #
+      # @param name [String] a real collection's name, not an alias
+      def update_collection_schema!(name)
+        live_fields = client.collections[name].retrieve['fields']
 
         missing = Schema.missing_fields(live_fields)
         if missing.any?
-          schema_client.collections[collection_name].update(fields: missing)
+          schema_client.collections[name].update(fields: missing)
           Rails.logger.info do
-            "[spree_typesense] added #{missing.map { |f| f[:name] }.join(', ')} to collection '#{collection_name}'"
+            "[spree_typesense] added #{missing.map { |f| f[:name] }.join(', ')} to collection '#{name}'"
           end
         end
 
         Schema.type_mismatches(live_fields).each do |mismatch|
           Rails.logger.warn do
-            "[spree_typesense] collection '#{collection_name}' declares '#{mismatch[:name]}' as " \
+            "[spree_typesense] collection '#{name}' declares '#{mismatch[:name]}' as " \
             "#{mismatch[:live_type]}, but this release declares it #{mismatch[:type]}. Typesense cannot change " \
-            "a field's type in place: drop the collection and reindex (`rake spree:search:reindex`)."
+            "a field's type in place: reindex (`rake spree:search:reindex`), which builds a fresh collection."
           end
         end
       end

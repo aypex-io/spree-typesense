@@ -316,6 +316,7 @@ RSpec.describe Spree::SearchProvider::Typesense do
 
       it 'removes a product from both' do
         index_as('prod_w', [ws_doc('prod_w')])
+        expect(ids_in(building)).to eq(['prod_w_en_USD'])
 
         provider.remove_by_id('prod_w')
 
