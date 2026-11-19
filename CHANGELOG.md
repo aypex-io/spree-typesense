@@ -1,6 +1,6 @@
 # Changelog
 
-## 6.0.0 (unreleased)
+## 6.0.0 (2026-11-19)
 
 The first release as **spree-typesense** (`gem 'spree-typesense', '~> 6.0'`),
 renamed from spree_typesense as the other Aypex Spree gems are named. Its major
