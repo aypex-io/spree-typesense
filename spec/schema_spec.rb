@@ -45,7 +45,13 @@ RSpec.describe Spree::SearchProvider::Typesense::Schema do
       available_on created_at updated_at
     ]
     expect(definition[:fields].map { |f| f[:name] })
-      .to match_array(expected + %w[preorder collection_ids available_on_i])
+      .to match_array(expected + %w[preorder collection_ids available_on_i indexed_at])
+  end
+
+  # Derived at index time: when the job read the product, in epoch ms. Stale
+  # removal deletes only documents stamped earlier than its own read (#9).
+  it 'declares indexed_at as an optional int64' do
+    expect(field('indexed_at')).to include(type: 'int64', optional: true, facet: false)
   end
 
   # Emitted on Spree 6.x only, for the in_collection filter. Filtering needs no

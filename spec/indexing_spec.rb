@@ -237,6 +237,67 @@ RSpec.describe Spree::SearchProvider::Typesense do
     end
   end
 
+  # Two index jobs for one product can overlap. Each deletes the product's
+  # documents it did not produce, but only those written before it read the
+  # product, so an older job finishing last cannot drop what a newer job
+  # wrote (#9).
+  describe 'overlapping index jobs for one product' do
+    let(:collection) { provider.client.collections[provider.collection_name] }
+
+    def job_doc(locale, currency)
+      { id: "prod_j_#{locale}_#{currency}", product_id: 'prod_j', locale: locale, currency: currency,
+        status: 'active', name: 'Product j', price: 1.0, in_stock: true, store_ids: ['1'],
+        discontinue_on: 0, units_sold_count: 0, created_at: '2024-01-01T00:00:00Z' }
+    end
+
+    # Runs one index job that read the product at `read_at`.
+    def job(read_at, documents)
+      presenter_class = class_double('SpreeTypesense::ProductPresenter')
+      allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: documents) }
+      allow(provider).to receive(:presenter_class).and_return(presenter_class)
+      allow(provider).to receive(:current_time_ms).and_return(read_at)
+      provider.index(FakeProduct.new('prod_j'))
+    end
+
+    def stored_ids
+      collection.documents.search(q: '*', per_page: 100)['hits'].map { |h| h['document']['id'] }
+    end
+
+    it 'stamps every document with the time the product was read' do
+      job(1_800_000_000_000, [job_doc('en', 'USD')])
+
+      expect(collection.documents['prod_j_en_USD'].retrieve['indexed_at']).to eq(1_800_000_000_000)
+    end
+
+    it 'keeps the documents a newer job wrote when an older one finishes last' do
+      job(1_800_000_002_000, [job_doc('en', 'USD'), job_doc('en', 'EUR')])
+      job(1_800_000_001_000, [job_doc('en', 'USD')])
+
+      expect(stored_ids).to contain_exactly('prod_j_en_USD', 'prod_j_en_EUR')
+    end
+
+    it 'removes the documents an older job wrote that the product no longer produces' do
+      job(1_800_000_001_000, [job_doc('en', 'USD'), job_doc('en', 'EUR')])
+      job(1_800_000_002_000, [job_doc('en', 'USD')])
+
+      expect(stored_ids).to contain_exactly('prod_j_en_USD')
+    end
+
+    it 'keeps a newer job\'s documents when an older job finds the product produces none' do
+      job(1_800_000_002_000, [job_doc('en', 'USD')])
+      job(1_800_000_001_000, [])
+
+      expect(stored_ids).to contain_exactly('prod_j_en_USD')
+    end
+
+    it 'removes older documents when a newer job finds the product produces none' do
+      job(1_800_000_001_000, [job_doc('en', 'USD')])
+      job(1_800_000_002_000, [])
+
+      expect(stored_ids).to eq([])
+    end
+  end
+
   it 'removes a document by prefixed id' do
     provider.index_batch([
       { 'id' => 'prod_b_en_USD', 'product_id' => 'prod_b', 'locale' => 'en',
@@ -523,7 +584,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
 
       expect(provider.index_batch(batch)).to eq(import_results(:ok, :ok, :ok))
       expect(documents).to have_received(:import)
-        .with(batch.map { |d| hash_including('id' => d[:id], 'available_on_i' => 0) }, action: 'upsert')
+        .with(batch.map { |d| hash_including('id' => d[:id], 'available_on_i' => 0, 'indexed_at' => kind_of(Integer)) },
+              action: 'upsert')
     end
 
     it 'raises once the batch is sent, naming every document Typesense rejected' do
@@ -561,6 +623,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
   end
 
   describe '#index' do
+    before { allow(provider).to receive(:current_time_ms).and_return(1_800_000_000_000) }
+
     def index_producing(product_id, produced)
       presenter_class = class_double('SpreeTypesense::ProductPresenter')
       allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: produced) }
@@ -575,7 +639,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
 
       expect(documents).to have_received(:import).ordered
       expect(documents).to have_received(:delete)
-        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_en-US_USD`]').ordered
+        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_en-US_USD`] && indexed_at:<1800000000000')
+        .ordered
     end
 
     it 'deletes all of its documents, and imports nothing, when the product produces none' do
@@ -584,7 +649,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
       index_producing('prod_x', [])
 
       expect(documents).not_to have_received(:import)
-      expect(documents).to have_received(:delete).with(filter_by: 'product_id:=prod_x')
+      expect(documents).to have_received(:delete).with(filter_by: 'product_id:=prod_x && indexed_at:<1800000000000')
     end
 
     # The documents Typesense did take are current, so the stale ones still go;
@@ -595,7 +660,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
       expect { index_producing('prod_x', [doc('prod_x_en_USD'), doc('prod_x_de_EUR')]) }
         .to raise_error(described_class::ImportError, /prod_x_de_EUR/)
       expect(documents).to have_received(:delete)
-        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_de_EUR`]')
+        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_de_EUR`] && indexed_at:<1800000000000')
     end
 
     # Unreachable: nothing was upserted, so nothing is known to be stale.
@@ -622,7 +687,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
 
       index_producing('prod_x || product_id:=prod_y', [])
 
-      expect(documents).to have_received(:delete).with(filter_by: 'product_id:=prod_xproduct_idprod_y')
+      expect(documents).to have_received(:delete)
+        .with(filter_by: 'product_id:=prod_xproduct_idprod_y && indexed_at:<1800000000000')
     end
   end
 end
