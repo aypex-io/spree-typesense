@@ -62,7 +62,6 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
   before do
     reset_typesense_index!('shop')
     reset_typesense_index!('shop_v2')
-    allow(relation).to receive(:reorder).with(id: :asc).and_return(relation)
     allow(relation).to receive(:unscope).with(:order).and_return(relation)
     allow(relation).to receive(:preload_associations_lazily).and_return(relation)
     stub_presenter({})

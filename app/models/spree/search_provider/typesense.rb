@@ -114,7 +114,7 @@ module Spree
       end
 
       # Mirrors meilisearch.rb#reindex: default scope is store.products (not
-      # Spree::Product.where(store_id:)), batch size 500, deterministic order,
+      # Spree::Product.where(store_id:)), batch size 500, in primary key order,
       # lazy-preloaded associations. Returns the number of DOCUMENTS indexed
       # (not products — one product can emit N locale x currency documents).
       #
@@ -365,7 +365,10 @@ module Spree
       def index_scope(scope, into:)
         indexed = 0
         failures = []
-        scope.reorder(id: :asc).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
+        # find_in_batches walks by primary key and ignores a scoped order,
+        # which Rails warns about, or rejects under error_on_ignored_order,
+        # so the scope reaches it without one (#21).
+        scope.unscope(:order).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
           read_at = current_time_ms
           documents = batch.flat_map { |product| presenter_class.new(product, store).call }
           next if documents.empty?
