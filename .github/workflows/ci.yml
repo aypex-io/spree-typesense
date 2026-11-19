@@ -50,6 +50,9 @@ jobs:
 
       - uses: ruby/setup-ruby@v1
         with:
+          # Newest 4.0.x, the series the consuming apps run. A gem has no
+          # .ruby-version to fall back on.
+          ruby-version: '4.0'
           bundler-cache: true
           # No Gemfile.lock is committed, so the bundler cache key derives from
           # the Gemfile/gemspec — identical across matrix legs. Without this,
