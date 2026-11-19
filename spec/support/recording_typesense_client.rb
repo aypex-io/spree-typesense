@@ -3,8 +3,13 @@
 # whatever the block returns, or raises what it raises. Specs about what
 # Typesense DOES with a request run against the real server instead.
 #
+# The provider sends every search as a multi_search (a POST). #searches lists
+# each search sent, whichever way. A block answering one result is taken as
+# the answer to every search of a multi_search; a block answering a
+# multi_search body (`'results' => [...]`) is used as it is.
+#
 #   client = RecordingTypesenseClient.new { |kind, params| { 'found' => 0, 'hits' => [] } }
-#   allow(provider).to receive(:client).and_return(client)
+#   allow(provider).to receive(:search_client).and_return(client)
 #   provider.search_and_filter(...)
 #   client.searches.first[:filter_by]
 class RecordingTypesenseClient
@@ -14,18 +19,23 @@ class RecordingTypesenseClient
 
   def initialize(&responder)
     @requests = []
-    @responder = responder || ->(kind, params) { kind == :multi_search ? { 'results' => params[:searches].map { EMPTY_RESULT } } : EMPTY_RESULT }
+    @responder = responder || ->(_kind, _params) { EMPTY_RESULT }
   end
 
   def collections = Hash.new { |hash, name| hash[name] = Collection.new(self, name) }
 
   def multi_search = MultiSearch.new(self)
 
-  def searches = requests.select { |kind, _| kind == :search }.map(&:last)
+  def searches
+    requests.flat_map { |kind, params| kind == :multi_search ? params[:searches] : [params] }
+  end
 
   def record(kind, params)
     requests << [kind, params]
-    @responder.call(kind, params)
+    answer = @responder.call(kind, params)
+    return answer unless kind == :multi_search && !answer.key?('results')
+
+    { 'results' => params[:searches].map { answer } }
   end
 
   Collection = Struct.new(:client, :name) do

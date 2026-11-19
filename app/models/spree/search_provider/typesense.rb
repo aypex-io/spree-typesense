@@ -130,6 +130,10 @@ module Spree
       # from the previous collection until the swap, and documents of
       # products that are gone or out of scope go with the old collection.
       #
+      # The scope becomes the whole index: pass every product the store
+      # should find (the rake task passes store.products). To refresh some
+      # products, use #index for each.
+      #
       # A batch with rejected documents does not stop the reindex, and those
       # documents are not counted. Once every batch is sent, an ImportError
       # names them all, so `rake spree:search:reindex` fails visibly; the new
@@ -398,24 +402,56 @@ module Spree
       # it replaced. Typesense refuses an alias whose name a collection holds,
       # so a real collection holding the live name is dropped first; searches
       # in that moment get a 404 and answer from the Database provider.
-      # Older versioned collections go, newer ones stay: a newer one belongs
-      # to a reindex still running, which will drop this one when it swaps.
+      # Pointing the alias is retried once: after that drop, failing it would
+      # leave the store with no index. Once it points at the new collection
+      # the reindex has succeeded, so the clean-up after it only logs what it
+      # could not do. Older versioned collections go, newer ones stay: a newer
+      # one belongs to a reindex still running, which will drop this one when
+      # it swaps.
       def swap_live_alias(layout, building)
         previous = layout.alias_target(layout.live_name)
         legacy = layout.legacy_collection?
         layout.drop!(layout.live_name) if legacy
-        layout.point!(layout.live_name, building)
-        layout.unpoint!(layout.building_name)
+        point_live_alias(layout, building)
 
-        replaced = layout.versioned_collections.select { |name| name < building }
-        replaced.each { |name| layout.drop!(name) }
+        after_swap("remove the #{layout.building_name} alias") { layout.unpoint!(layout.building_name) }
+        replaced = after_swap('list the collections it replaced') do
+          layout.versioned_collections.select { |name| name < building }
+        end || []
+        dropped = replaced.count { |name| after_swap("drop #{name}") { layout.drop!(name) } }
 
         Rails.logger.info do
           was = [(layout.live_name if legacy), previous].compact.uniq.join(', ')
-          "[spree_typesense] #{layout.live_name} now serves #{building}" \
-            "#{" (was #{was})" unless was.empty?}; dropped #{replaced.size} older collection(s)" \
-            "#{legacy ? ' and the real collection holding the live name' : ''}"
+          "[spree_typesense] #{layout.live_name} now serves #{building}#{" (was #{was})" unless was.empty?}; " \
+            "dropped #{dropped} older collection(s)#{' and the real collection holding the live name' if legacy}"
         end
+      end
+
+      def point_live_alias(layout, building)
+        attempts = 0
+        begin
+          layout.point!(layout.live_name, building)
+        rescue StandardError => e
+          attempts += 1
+          raise if attempts > 1
+
+          Rails.logger.warn { "[spree_typesense] pointing #{layout.live_name} at #{building} failed (#{e.message}); retrying" }
+          retry
+        end
+      end
+
+      # Clean-up once the live alias points at the new collection: the
+      # reindex has succeeded, so a failure here is logged for the next
+      # reindex to finish, not raised. Returns the block's value (truthy for
+      # a drop), or nil when it failed.
+      def after_swap(what)
+        yield || true
+      rescue StandardError => e
+        Rails.logger.warn do
+          "[spree_typesense] the swap succeeded, but could not #{what} (#{e.class}: #{e.message}); " \
+            'the next reindex will'
+        end
+        nil
       end
 
       # The rejected documents of an import, logged one by one. A result names
@@ -468,12 +504,15 @@ module Spree
         nil
       end
 
-      # The Typesense request; callers wrap it in #request_typesense.
+      # The Typesense request; callers wrap it in #request_typesense. Sent as
+      # a one-search multi_search, a POST: a GET search carries its filter in
+      # the query string, which Typesense caps at 4000 characters, and a
+      # selection across option types can make a far longer filter.
       def execute_search(query:, conditions:, sort:, page:, limit:, facet_by: nil, filters: {})
-        search_client.collections[collection_name].documents.search(
-          search_params(query: query, conditions: conditions, sort: sort, page: page, limit: limit, facet_by: facet_by,
-                        filters: filters)
-        )
+        perform_searches(
+          [search_params(query: query, conditions: conditions, sort: sort, page: page, limit: limit,
+                         facet_by: facet_by, filters: filters)]
+        ).first
       end
 
       # Faceted read path. Returns [main_result, distribution, stats], and
@@ -516,20 +555,39 @@ module Spree
          Facets.normalize_stats(results.first['facet_counts'])]
       end
 
+      # The disjunctive facet searches, in one request.
+      def execute_multi_search(searches) = perform_searches(searches)
+
       # Typesense answers multi_search with HTTP 200 even when an individual
       # search failed — the failure is a per-result {error:, code:} body, NOT an
-      # exception. Diverges from the single-search path, so raise it here as
-      # one, or a broken filter would silently serve the wrong facet counts.
-      def execute_multi_search(searches)
+      # exception. Raise it here as the error a search would have raised for
+      # that status, so a broken filter cannot silently serve wrong results or
+      # counts, and a 5xx counts as transient.
+      def perform_searches(searches)
         response = search_client.multi_search.perform(
           { searches: searches.map { |s| s.merge(collection: collection_name) } }
         )
         results = response['results']
 
         failed = Array(results).find { |r| r['error'] }
-        raise SearchError, "multi_search failed: #{failed['code']} #{failed['error']}" if failed
+        raise search_error_for(failed) if failed
 
         results
+      end
+
+      PER_RESULT_ERRORS = {
+        400 => ::Typesense::Error::RequestMalformed,
+        401 => ::Typesense::Error::RequestUnauthorized,
+        403 => ::Typesense::Error::RequestUnauthorized,
+        404 => ::Typesense::Error::ObjectNotFound,
+        422 => ::Typesense::Error::ObjectUnprocessable
+      }.freeze
+      private_constant :PER_RESULT_ERRORS
+
+      def search_error_for(failed)
+        code = failed['code'].to_i
+        klass = PER_RESULT_ERRORS.fetch(code) { (500..599).cover?(code) ? ::Typesense::Error::ServerError : SearchError }
+        klass.new("multi_search failed: #{failed['code']} #{failed['error']}")
       end
 
       # Start from the main (fully filtered) distribution, then for each option

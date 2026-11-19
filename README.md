@@ -95,6 +95,11 @@ and with it the documents of products that were deleted or left the scope.
   had, and the rake task fails naming the rejected documents.
 - Only a reindex creates the index. Until the first one, index jobs fail and
   retry, and searches answer from the `Database` provider.
+- The scope a reindex is given becomes the whole index. `rake
+  spree:search:reindex` passes every product of the store; passing fewer
+  (`provider.reindex(Spree::Product.where(id: ids))`) would leave only those
+  searchable. To refresh some products, index them one by one
+  (`provider.index(product)`, or Spree's `product.add_to_search_index`).
 
 ## Known limitations
 
@@ -183,8 +188,8 @@ emits the same fields as on 5.6:
 - **Products belong to collections, and `in_collection` is a whitelisted
   filter.** Documents carry `collection_ids` (6.x only), and `in_collection`
   filters on it, so a collection listing returns, counts and facets only that
-  collection. A listing in manual (position) order is answered by the
-  `Database` provider; see [Known limitations](#known-limitations).
+  collection. A listing in manual (position) order sorts by the product's
+  position in it; see [Known limitations](#known-limitations).
 - **Descriptions are rich-text HTML in a plain column.** `description` is
   indexed as plain text (`Spree::RichTextHelper.to_plain_text`), as
   `spree_meilisearch` 6.0 does, so tag names are not searchable.

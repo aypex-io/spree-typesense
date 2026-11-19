@@ -277,7 +277,9 @@ module SpreeTypesense
     # under a category AND one of its descendants takes the lowest position
     # in the subtree, as core's Database provider orders a category page
     # (`MIN(position)` over the subtree) and spree_meilisearch's
-    # `category_positions` do. A membership without a position adds nothing.
+    # `category_positions` do. A membership without a position adds nothing,
+    # nor does one whose collection or category is gone: Spree 6 removes a
+    # deleted grouping's memberships in a later job (`destroy_async`).
     def position_fields
       @position_fields ||= collection_positions.merge(category_positions).to_h do |prefixed_id, position|
         ["pos_#{prefixed_id}", position]
@@ -286,15 +288,19 @@ module SpreeTypesense
 
     def collection_positions
       product.product_collections.each_with_object({}) do |membership, acc|
-        acc[membership.collection.prefixed_id] = membership.position unless membership.position.nil?
+        collection = membership.collection
+        next if collection.nil? || membership.position.nil?
+
+        acc[collection.prefixed_id] = membership.position
       end
     end
 
     def category_positions
       product.product_categories.each_with_object({}) do |membership, acc|
-        next if membership.position.nil?
+        grouping = membership.category
+        next if grouping.nil? || membership.position.nil?
 
-        membership.category.self_and_ancestors.each do |category|
+        grouping.self_and_ancestors.each do |category|
           acc[category.prefixed_id] = [acc[category.prefixed_id], membership.position].compact.min
         end
       end

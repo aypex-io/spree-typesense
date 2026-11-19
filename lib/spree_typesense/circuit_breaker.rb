@@ -57,6 +57,7 @@ module SpreeTypesense
       @failures = 0
       @opened_at = nil
       @probing = false
+      @probe_started_at = nil
     end
 
     # @return [Symbol] :closed, :open or :half_open
@@ -65,7 +66,9 @@ module SpreeTypesense
     end
 
     # Whether this request may go to Typesense. Half-open, only the first
-    # caller may, as the probe.
+    # caller may, as the probe. A probe that reports nothing for a whole
+    # period (killed by a request timeout or a thread kill, which no rescue
+    # sees) is given up on, and the next caller probes instead.
     # @return [Boolean]
     def allow_request?
       @mutex.synchronize do
@@ -73,9 +76,11 @@ module SpreeTypesense
         when :closed then true
         when :open then false
         else
-          next false if @probing
+          next false if @probing && @clock.call - @probe_started_at < @open_seconds
 
           @probing = true
+          @probe_started_at = @clock.call
+          true
         end
       end
     end
