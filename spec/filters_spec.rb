@@ -13,8 +13,8 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters' do
   end
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch([
@@ -89,7 +89,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when the engine really errors'
   end
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
+    reset_typesense_index!(store.code)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     allow(Spree::SearchProvider::Database).to receive(:new).and_return(database)
@@ -119,8 +119,8 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters price range beyond th
   let(:highest)   { 122.5 }
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch(prices.each_with_index.map do |price, i|

@@ -166,7 +166,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
     before do
       allow(Spree::Deprecation).to receive(:warn).and_call_original
       allow(Spree).to receive(:search_provider).and_return('Spree::SearchProvider::Typesense')
-      collection.delete rescue nil
+      reset_typesense_index!('compat')
       allow(provider).to receive(:locale).and_return('en')
       allow(provider).to receive(:currency).and_return('USD')
       stub_ar_lookup(Spree::Category, [shirts])
@@ -174,7 +174,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'across Spree versions' do
 
     it 'are never triggered by registering, indexing, searching, filtering or faceting' do
       SpreeTypesense.register_search_product_presenter!
-      provider.ensure_index_settings!
+      bootstrap_index!(provider)
       provider.index_batch(provider.send(:presenter_class).new(product, presenter_store).call)
 
       result = provider.search_and_filter(scope: FakeScope.new(%w[prod_dep]), query: 'plain', sort: 'price')

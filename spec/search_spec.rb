@@ -13,8 +13,8 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
   end
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch([

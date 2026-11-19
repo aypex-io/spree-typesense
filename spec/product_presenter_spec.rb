@@ -280,8 +280,8 @@ RSpec.describe SpreeTypesense::ProductPresenter do
     let(:collection) { provider.client.collections[provider.collection_name] }
 
     before do
-      collection.delete rescue nil
-      provider.ensure_index_settings!
+      reset_typesense_index!(store.code)
+      bootstrap_index!(provider)
     end
 
     it 'accepts every document and field' do

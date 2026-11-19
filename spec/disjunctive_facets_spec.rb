@@ -30,8 +30,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
   end
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch([
@@ -88,8 +88,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
     end
 
     before do
-      provider.client.collections[provider.collection_name].delete rescue nil
-      provider.ensure_index_settings!
+      reset_typesense_index!(store.code)
+      bootstrap_index!(provider)
       provider.index_batch([
         doc('prod_1', %w[ov_red ov_small]),
         doc('prod_2', %w[ov_red ov_large]),
