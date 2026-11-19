@@ -79,10 +79,28 @@
 
 ### Upgrading
 
-On Spree 6, a store whose default market locale differs from
-`config.i18n.default_locale`: bump the gem and run
-`bin/rake spree:search:reindex` to fill in the names. Other stores need do
-nothing.
+Run `bin/rake spree:search:reindex` straight after deploying: every store
+must, for the new document fields and the alias layout.
+
+1. The first reindex builds `products_<code>_v<epoch ms>`, then drops 0.2.0's
+   real collection `products_<code>` and creates the alias of that name in
+   its place (Typesense refuses an alias named like a live collection).
+   Searches in that moment answer from the `Database` provider.
+2. Until it has run, on Spree 6, multi-option filters and manual listings are
+   answered by the `Database` provider (correct, more slowly).
+3. Rolling back to 0.2.0 works: its reindex recreates a real collection,
+   which Typesense serves ahead of the alias; searches return nothing until
+   it has filled it.
+
+See [Upgrading](README.md#upgrading) for the details.
+
+### Known limitations
+
+See [Known limitations](README.md#known-limitations): buyer-catalog
+narrowing is not mirrored in facets; manual sort adds a schema field per
+category and collection; filters across more than six option types fall back
+to core's narrowing; `price_between`, `cf_*` and other ransack filters and
+sorts are not served by the index.
 
 ## 0.2.0 (2026-10-31)
 

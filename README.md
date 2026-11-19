@@ -1,7 +1,7 @@
 # spree_typesense
 
 A [Typesense](https://typesense.org) search provider for [Spree Commerce](https://spreecommerce.org),
-supporting Spree 5.5 to 6.0 (`spree_core >= 5.5, < 6.1`).
+supporting Spree 5.5 to 6.0 (`spree_core >= 5.5, < 6.1`; tested on 5.5.1, 5.6.1, 6.0.0 and 6.0.5).
 
 Spree 5.5 ships two search providers — `Database` and `Meilisearch` (which moved
 into the `spree_meilisearch` gem in 6.0). This gem adds a Typesense one,
@@ -207,35 +207,49 @@ suite raises on any.
 
 ## Upgrading
 
-### To this release
+### To 0.3.0
 
-Bump the gem, then run `bin/rake spree:search:reindex`. The reindex first
-brings the existing collection up to this release's schema: it adds every
-field the collection lacks (`collection_ids`, for a collection a 0.1.x release
-created) in place, through Typesense's schema update. Nothing is dropped, and
-searches keep answering throughout; Typesense holds writes to the collection
-until the field is added.
+Bump the gem, then run `bin/rake spree:search:reindex` straight after
+deploying. It is required: documents gain `indexed_at`, and on Spree 6
+`option_value_combination_ids` and the `pos_*` position fields, and the
+index moves behind an alias.
 
-A store on Spree 5.6 can bump and reindex there, ahead of moving to Spree 6:
-the collection then already has the field.
+- **The first reindex replaces the 0.2.0 collection.** It builds
+  `products_<store code>_v<epoch ms>`, then drops the real collection
+  `products_<store code>` that 0.2.0 searched and creates the alias of that
+  name in its place. Typesense refuses an alias named like an existing
+  collection, so for the moment between the two, searches get a 404 and
+  answer from the `Database` provider.
+- **Until it has run**, on Spree 6, a filter on values of two or more option
+  types asks for a field the old collection lacks, and a manual listing
+  sorts by positions it lacks. Typesense refuses both, and the `Database`
+  provider answers them: correct, more slowly. The option filter is reported
+  as an error; the manual listing only logged. Index jobs keep writing to the
+  old collection.
+- **If Typesense rejects a document**, the reindex fails naming it and the
+  store keeps the index it had. On a multi-store install
+  `spree:search:reindex` then stops at that store: fix the documents and
+  rerun it.
+- **Rolling back to 0.2.0** works: its reindex creates a real
+  `products_<store code>` again, which Typesense serves ahead of the alias.
+  Searches return nothing until that reindex has filled it, so roll back at
+  a quiet time. A later 0.3 reindex drops it and the 0.3 collection left
+  behind.
 
-The reindex now fails, naming the documents, if Typesense rejects any of them.
-On a multi-store install, `spree:search:reindex` then stops at that store, and
-the stores after it are not reindexed: fix the rejected documents and rerun it.
+On Spree 6, a store whose default market locale differs from the
+application's `config.i18n.default_locale` also gets its product names back
+in the index (they were indexed blank).
 
 ### To Spree 6.0
 
 1. Upgrade Spree, run its migrations, then
    `bin/rake spree:migrate_taxons_to_categories_and_collections`.
 2. Then run `bin/rake spree:search:reindex`, straight after: documents gain
-   `collection_ids` from the migrated collections. Category ids and option
-   names do not change. If the collection predates this release, the same
-   reindex adds the field first.
+   `collection_ids` and positions from the migrated collections. Category ids
+   and option names do not change.
 
-Until a product is reindexed its documents carry no `collection_ids`, so
-collection listings sorted by a field (price, name, ...) miss it in the
-meantime. Listings in manual order are answered by the `Database` provider and
-are unaffected.
+Until the reindex has run, documents carry no `collection_ids`, so
+collection listings miss products in the meantime.
 
 ### A field whose type changed
 
