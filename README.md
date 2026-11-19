@@ -59,6 +59,24 @@ answers. Set `TYPESENSE_SEARCH_TIMEOUT` (in seconds, e.g. `1.5`) to change it.
 Indexing keeps a 5 second timeout and one retry, and Spree's index jobs retry
 on failure.
 
+## Reindexing
+
+`bin/rake spree:search:reindex` builds each store's index afresh: a new
+collection, `products_<store code>_v<epoch ms>`, filled from the store's
+products, then swapped in behind the alias `products_<store code>`, which is
+the name searches and index jobs use. The collection it replaced is dropped,
+and with it the documents of products that were deleted or left the scope.
+
+- Searches keep answering from the previous collection until the swap.
+- While a reindex runs, the collection it is filling is marked by the alias
+  `products_<store code>__building`, and a product saved meanwhile is written
+  to both, so the change survives the swap.
+- If Typesense rejects any document, or the reindex fails, the new collection
+  is dropped and the alias left where it was: the store keeps the index it
+  had, and the rake task fails naming the rejected documents.
+- Only a reindex creates the index. Until the first one, index jobs fail and
+  retry, and searches answer from the `Database` provider.
+
 ## Known limitations
 
 - **Manual (position) sort.** The index carries no positions. On Spree 6, a
@@ -67,10 +85,6 @@ on failure.
   orders it by position. With a text query the order is relevance. On Spree 5,
   whose `Database` provider applies no position order through the Store API,
   `manual` is Typesense's default ranking.
-- **A full reindex does not remove documents of deleted products.** It upserts
-  every product's documents. Spree's removal job deletes a product's documents
-  when the product is destroyed; to clear any left behind, drop the collection
-  and reindex (see [Upgrading](#upgrading)).
 - **Facets don't apply catalog narrowing.** Facet counts come from the index
   and the filters given, not from the product `scope` the filters endpoint
   passes, so narrowing applied only to that scope is not reflected: Spree 6's
@@ -199,23 +213,10 @@ are unaffected.
 
 ### A field whose type changed
 
-Typesense can add fields in place but cannot change a field's type. If a
-release changes one, the reindex logs a warning naming the field; drop the
-collection, `products_<store code>`, and reindex:
-
-```bash
-curl -X DELETE "$TYPESENSE_URL/collections/products_<store code>" \
-  -H "X-TYPESENSE-API-KEY: $TYPESENSE_API_KEY"
-bin/rake spree:search:reindex
-```
-
-or, from a console,
-`Spree::SearchProvider::Typesense.new(store).client.collections["products_#{store.code}"].delete`.
-
-While the collection is gone, searches answer from the `Database` provider.
-Once the reindex has recreated it, they answer from Typesense, which holds only
-the products indexed so far: search returns nothing at first, and is
-incomplete until the reindex finishes. Run it at a quiet time.
+Typesense can add a field to a collection in place but cannot change a field's
+type. A release that changes one needs nothing special: the reindex builds a
+fresh collection with the declared types. Until then
+`ensure_index_settings!` warns, naming the field.
 
 ## Local development
 

@@ -20,6 +20,15 @@
   exactly as core's own 5.x presenter builds them, which this gem promises
   there, so 5.x is left as it was.
 
+- **A full reindex swaps in a fresh collection** (#4). `rake
+  spree:search:reindex` builds `products_<code>_v<epoch ms>`, then points the
+  alias `products_<code>` at it and drops the collection it replaced, so
+  documents of deleted or out-of-scope products no longer linger in totals
+  and facets. Searches answer from the old collection until the swap; products
+  saved during the reindex are written to both. Rejected documents, or any
+  error, leave the store on the index it had. A field whose type changed now
+  needs only a reindex. Only a reindex creates the index.
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from
