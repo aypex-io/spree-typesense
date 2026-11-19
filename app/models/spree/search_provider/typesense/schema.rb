@@ -77,6 +77,12 @@ module Spree
               # NOT EXISTS / IS NULL three-way clause.
               { name: 'available_on_i', type: 'int64', facet: false },
 
+              # DERIVED: when the index job read the product, in epoch ms.
+              # Stale-document removal deletes only documents stamped before
+              # its own read, so an older job finishing after a newer one
+              # cannot drop what the newer one wrote.
+              { name: 'indexed_at', type: 'int64', facet: false, optional: true },
+
               # Not emitted on spree_core 5.5.x, whose products have no
               # preorder?. Emitted on 5.6+ and 6.x (product.preorder?).
               # Declared optional so the collection stays valid whichever

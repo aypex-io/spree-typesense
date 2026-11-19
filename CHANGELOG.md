@@ -29,6 +29,13 @@
   error, leave the store on the index it had. A field whose type changed now
   needs only a reindex. Only a reindex creates the index.
 
+- **Fix: overlapping index jobs for one product no longer drop the newer
+  job's documents** (#9). Each document is stamped `indexed_at`, the moment
+  its job read the product, and a job deletes only stale documents stamped
+  before its own read. Spree 6.0.5 runs one search job per store at a time,
+  but only under Solid Queue; this holds on any queue adapter (Sidekiq
+  included).
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from

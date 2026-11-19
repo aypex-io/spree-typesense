@@ -162,6 +162,11 @@ module Spree
       # and a product that lost a currency's price, say, must not stay
       # searchable in that market. A product that produces none loses them all.
       #
+      # Every document is stamped `indexed_at` with the moment the product was
+      # read, and only documents stamped earlier are deleted, so when two jobs
+      # for one product overlap, the older one finishing last cannot drop what
+      # the newer one wrote (#9).
+      #
       # Writes to the live collection and, while a reindex is filling one, to
       # that one too, so the change survives the swap. A collection being
       # built that has since gone (its reindex died) is skipped.
@@ -169,18 +174,19 @@ module Spree
       # Raises ImportError (after the deletion) when Typesense rejects a
       # document, so the index job retries it.
       def index(product)
+        read_at = current_time_ms
         documents = Array(presenter_class.new(product, store).call)
 
         results = nil
         rejected = nil
         each_write_target do |target, live|
           begin
-            batch_results = index_batch(documents, into: target)
+            batch_results = index_batch(documents, into: target, indexed_at: read_at)
             results = batch_results if live
           rescue ImportError => e
             rejected ||= e
           end
-          remove_stale_documents(product.prefixed_id, documents, from: target)
+          remove_stale_documents(product.prefixed_id, documents, from: target, written_before: read_at)
         end
         raise rejected if rejected
 
@@ -194,12 +200,13 @@ module Spree
       #
       # @param documents [Array<Hash>]
       # @param into [String] the collection or alias to import into
+      # @param indexed_at [Integer] when the products were read, epoch ms
       # @return [Array<Hash>, nil] Typesense's per-document results
       # @raise [ImportError] when Typesense rejected any document
-      def index_batch(documents, into: collection_name)
+      def index_batch(documents, into: collection_name, indexed_at: current_time_ms)
         return if documents.blank?
 
-        documents = documents.map { |d| derive_fields(d) }
+        documents = documents.map { |d| derive_fields(d, indexed_at) }
         results = client.collections[into].documents.import(documents, action: 'upsert')
 
         failures = import_failures(documents, results, into)
@@ -362,12 +369,13 @@ module Spree
         indexed = 0
         failures = []
         scope.reorder(id: :asc).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
+          read_at = current_time_ms
           documents = batch.flat_map { |product| presenter_class.new(product, store).call }
           next if documents.empty?
 
           accepted = documents.size
           begin
-            index_batch(documents, into: into)
+            index_batch(documents, into: into, indexed_at: read_at)
           rescue ImportError => e
             failures.concat(e.failures)
             accepted -= e.failures.size
@@ -429,14 +437,15 @@ module Spree
       end
 
       # Deletes the product's documents in `from` other than `documents`; all
-      # of them when `documents` is empty. Ids go into the filter quoted in
-      # backticks, Typesense's string literal, because locales such as `en-US`
-      # put a hyphen in them. An id that itself holds a backtick cannot be
-      # quoted, so nothing is deleted then rather than risk deleting the wrong
-      # documents.
-      def remove_stale_documents(prefixed_id, documents, from:)
+      # of them when `documents` is empty. Only documents written before
+      # `written_before` go: a later job's are its own business. Ids go into
+      # the filter quoted in backticks, Typesense's string literal, because
+      # locales such as `en-US` put a hyphen in them. An id that itself holds a
+      # backtick cannot be quoted, so nothing is deleted then rather than risk
+      # deleting the wrong documents.
+      def remove_stale_documents(prefixed_id, documents, from:, written_before:)
         kept_ids = documents.map { |d| (d[:id] || d['id']).to_s }
-        return delete_product_documents(prefixed_id, from: from) if kept_ids.empty?
+        return delete_product_documents(prefixed_id, from: from, written_before: written_before) if kept_ids.empty?
 
         if kept_ids.any? { |id| id.include?('`') }
           Rails.logger.warn { "[spree_typesense] not removing stale documents of #{prefixed_id}: an id holds a backtick" }
@@ -445,15 +454,18 @@ module Spree
 
         client.collections[from].documents.delete(
           filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)} && " \
-                     "id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}]"
+                     "id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}] && indexed_at:<#{written_before.to_i}"
         )
       rescue ::Typesense::Error::ObjectNotFound
         nil
       end
 
-      # Nothing to remove from a collection that does not exist.
-      def delete_product_documents(prefixed_id, from:)
-        client.collections[from].documents.delete(filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)}")
+      # Nothing to remove from a collection that does not exist. With
+      # `written_before`, only documents stamped earlier.
+      def delete_product_documents(prefixed_id, from:, written_before: nil)
+        filter = "product_id:=#{sanitize_prefixed_id(prefixed_id)}"
+        filter += " && indexed_at:<#{written_before.to_i}" if written_before
+        client.collections[from].documents.delete(filter_by: filter)
       rescue ::Typesense::Error::ObjectNotFound
         nil
       end
@@ -745,8 +757,9 @@ module Spree
 
       # The presenter emits Spree's canonical document; Typesense needs fields
       # Spree does not provide. Derive them here rather than forking the presenter.
-      def derive_fields(document)
+      def derive_fields(document, indexed_at = nil)
         doc = document.transform_keys(&:to_s)
+        doc['indexed_at'] = indexed_at.to_i if indexed_at
         raw = doc['available_on']
         doc['available_on_i'] = raw.present? ? Time.parse(raw.to_s).to_i : 0
         doc
