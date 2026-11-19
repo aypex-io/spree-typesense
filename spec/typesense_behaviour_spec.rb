@@ -185,15 +185,14 @@ RSpec.describe 'Typesense engine behaviours the 0.3.0 layout relies on' do
   end
 
   # How the first 0.3.0 reindex replaces 0.2.0's real `products_<code>`
-  # collection with an alias of the same name: without a gap only if the alias
-  # can be created beside the collection, wins, and the collection can still
-  # be dropped by name.
+  # collection with an alias of the same name. Typesense refuses an alias
+  # whose name a collection holds, so the collection is dropped first and the
+  # alias created straight after; searches in between fall back.
   describe 'an alias named like an existing collection' do
     before do
       drop_alias('probe_same')
       %w[probe_same probe_same_v1].each { |name| drop_collection(name) }
       make('probe_same')
-      put('probe_same', 'id' => 'legacy', 'n' => 1)
       make('probe_same_v1')
       put('probe_same_v1', 'id' => 'fresh', 'n' => 1)
     end
@@ -203,27 +202,21 @@ RSpec.describe 'Typesense engine behaviours the 0.3.0 layout relies on' do
       %w[probe_same probe_same_v1].each { |name| drop_collection(name) }
     end
 
-    it 'can be created while the collection exists' do
-      expect { ts.aliases.upsert('probe_same', collection_name: 'probe_same_v1') }.not_to raise_error
+    it 'is refused while the collection exists' do
+      expect { ts.aliases.upsert('probe_same', collection_name: 'probe_same_v1') }
+        .to raise_error(Typesense::Error::ServerError, /conflicts with an existing collection name/)
     end
 
-    it 'answers searches by that name from the alias target' do
+    it 'can be created once the collection is dropped, and answers from its target' do
+      drop_collection('probe_same')
       ts.aliases.upsert('probe_same', collection_name: 'probe_same_v1')
 
       expect(ids(ts.collections['probe_same'].documents.search(q: '*'))).to eq(['fresh'])
     end
-
-    it 'drops the real collection, not the alias target, when deleting by that name' do
-      ts.aliases.upsert('probe_same', collection_name: 'probe_same_v1')
-      ts.collections['probe_same'].delete
-
-      expect(collection_names).to include('probe_same_v1')
-      expect(collection_names).not_to include('probe_same')
-    end
   end
 
-  # Rolling back to 0.2.0 runs its reindex, which first creates
-  # `products_<code>` and only on ObjectAlreadyExists updates it in place.
+  # Rolling back to 0.2.0 runs its reindex, which creates `products_<code>`
+  # (Typesense allows it beside the alias) and then upserts by that name.
   describe 'creating a collection named like an existing alias' do
     before do
       drop_alias('probe_legacy')
@@ -237,8 +230,17 @@ RSpec.describe 'Typesense engine behaviours the 0.3.0 layout relies on' do
       %w[probe_legacy probe_legacy_v1].each { |name| drop_collection(name) }
     end
 
-    it 'is refused as already existing' do
-      expect { make('probe_legacy') }.to raise_error(Typesense::Error::ObjectAlreadyExists)
+    it 'is allowed, leaving both' do
+      expect { make('probe_legacy') }.not_to raise_error
+      expect(collection_names).to include('probe_legacy', 'probe_legacy_v1')
+    end
+
+    it 'leaves imports and searches by that name on the alias target' do
+      make('probe_legacy')
+      ts.collections['probe_legacy'].documents.import([{ 'id' => 'y', 'n' => 1 }], action: 'upsert')
+
+      expect(ids(ts.collections['probe_legacy_v1'].documents.search(q: '*'))).to eq(['y'])
+      expect(ids(ts.collections['probe_legacy'].documents.search(q: '*'))).to eq(['y'])
     end
   end
 
@@ -260,9 +262,10 @@ RSpec.describe 'Typesense engine behaviours the 0.3.0 layout relies on' do
       expect(ids(result)).to eq(%w[b a])
     end
 
-    it 'raises RequestMalformed when sorting by a matching name no document has' do
+    # A manual listing of a grouping no indexed document belongs to.
+    it 'raises ObjectNotFound naming the field when sorting by a matching name no document has' do
       expect { ts.collections['probe_pos'].documents.search(q: '*', sort_by: 'pos_ctg_none:asc') }
-        .to raise_error(Typesense::Error::RequestMalformed)
+        .to raise_error(Typesense::Error::ObjectNotFound, /Could not find a field named `pos_ctg_none`/)
     end
   end
 
