@@ -46,6 +46,27 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
     expect(result.products.map(&:prefixed_id)).to eq(%w[prod_4])
   end
 
+  # One product sells blue-S and red-XL, another blue-XL: "blue AND XL" is
+  # only the second, with an exact total, and the scope is never narrowed by
+  # core (FakeScope raises if it is) (#10).
+  context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'filters values of two option types to products with one variant carrying both' do
+      provider.index_batch([
+        doc('prod_a', name: 'Herbal A').merge('option_value_ids' => %w[ov_blue ov_s ov_red ov_xl],
+                                              'option_value_combination_ids' => %w[ov_blue|ov_s ov_red|ov_xl]),
+        doc('prod_b', name: 'Herbal B').merge('option_value_ids' => %w[ov_blue ov_xl],
+                                              'option_value_combination_ids' => %w[ov_blue|ov_xl])
+      ])
+      allow(provider).to receive(:group_option_values_by_type).and_return(1 => %w[ov_blue], 2 => %w[ov_xl])
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_a prod_b]),
+                                          filters: { 'with_option_value_ids' => %w[ov_blue ov_xl] })
+
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_b])
+      expect(result.total_count).to eq(1)
+    end
+  end
+
   # THE security test.
   it 'never returns a product missing from the authorized scope' do
     result = provider.search_and_filter(scope: FakeScope.new(%w[prod_2]), query: 'herbal')

@@ -197,6 +197,69 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
     end
   end
 
+  # The token a variant's option values make, shared by the presenter and the
+  # query: sorted, so the selection's order cannot change it (#10).
+  describe '.combination_token' do
+    it 'sorts the ids and joins them with |' do
+      expect(described_class.combination_token(%w[ov_b ov_a])).to eq('ov_a|ov_b')
+    end
+  end
+
+  describe '.option_conditions' do
+    it 'answers nothing selected with no condition, exactly' do
+      expect(described_class.option_conditions({})).to eq([[], true])
+    end
+
+    it 'ORs the values of one type, exactly' do
+      expect(described_class.option_conditions(1 => %w[ov_red ov_blue]))
+        .to eq([['option_value_ids:=[ov_red,ov_blue]'], true])
+    end
+
+    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+      it 'asks for one variant carrying a value of each type, whatever order they were picked in' do
+        expect(described_class.option_conditions(1 => %w[ov_b], 2 => %w[ov_a]))
+          .to eq([['option_value_combination_ids:=[`ov_a|ov_b`]'], true])
+      end
+
+      it 'ORs every combination of the selected values' do
+        conditions, exact = described_class.option_conditions(1 => %w[ov_blue ov_red], 2 => %w[ov_s ov_xl])
+
+        expect(conditions).to eq(['option_value_combination_ids:=[`ov_blue|ov_s`,`ov_blue|ov_xl`,`ov_red|ov_s`,`ov_red|ov_xl`]'])
+        expect(exact).to be(true)
+      end
+
+      it 'drops ids that are not well-formed before combining' do
+        expect(described_class.option_conditions(1 => ['ov_a', 'ov_x`] || x'], 2 => %w[ov_b]))
+          .to eq([['option_value_combination_ids:=[`ov_a|ov_b`]'], true])
+      end
+
+      it 'falls back to the per-type pre-filter, inexactly, beyond six types' do
+        grouped = (1..7).to_h { |type| [type, ["ov_#{type}"]] }
+        conditions, exact = described_class.option_conditions(grouped)
+
+        expect(conditions).to eq(described_class.grouped_option_conditions(grouped))
+        expect(exact).to be(false)
+      end
+
+      it 'falls back to the per-type pre-filter, inexactly, beyond 1000 combinations' do
+        grouped = { 1 => (1..40).map { |i| "ov_c#{i}" }, 2 => (1..30).map { |i| "ov_s#{i}" } }
+        conditions, exact = described_class.option_conditions(grouped)
+
+        expect(conditions).to eq(described_class.grouped_option_conditions(grouped))
+        expect(exact).to be(false)
+      end
+    end
+
+    # 5.x decides "blue AND XL" on the product, as the index holds it, and
+    # its documents carry no combination tokens.
+    context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
+      it 'keeps the per-type conditions, narrowed by core' do
+        expect(described_class.option_conditions(1 => %w[ov_b], 2 => %w[ov_a]))
+          .to eq([['option_value_ids:=ov_b', 'option_value_ids:=ov_a'], false])
+      end
+    end
+  end
+
   describe '.sort_by' do
     it 'maps the supported sort params' do
       expect(described_class.sort_by('price')).to eq('price:asc')

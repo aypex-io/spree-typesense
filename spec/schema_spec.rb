@@ -45,7 +45,12 @@ RSpec.describe Spree::SearchProvider::Typesense::Schema do
       available_on created_at updated_at
     ]
     expect(definition[:fields].map { |f| f[:name] })
-      .to match_array(expected + %w[preorder collection_ids available_on_i indexed_at])
+      .to match_array(expected + %w[preorder collection_ids option_value_combination_ids available_on_i indexed_at])
+  end
+
+  # Spree 6 only: one token per set of a variant's option values (#10).
+  it 'declares option_value_combination_ids as an optional, filterable string array' do
+    expect(field('option_value_combination_ids')).to include(type: 'string[]', optional: true, facet: false)
   end
 
   # Derived at index time: when the job read the product, in epoch ms. Stale

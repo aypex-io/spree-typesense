@@ -209,21 +209,49 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests across option 
     provider.search_and_filter(scope: scope, filters: { 'with_option_value_ids' => grouped.values.flatten })
   end
 
-  it 'narrows the scope through core when values of two option types are selected' do
-    allow(scope).to receive(:with_option_value_ids).and_return(FakeScope.new(%w[prod_2]))
+  context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
+    it 'narrows the scope through core when values of two option types are selected' do
+      allow(scope).to receive(:with_option_value_ids).and_return(FakeScope.new(%w[prod_2]))
 
-    result = search(1 => %w[ov_blue], 2 => %w[ov_xl ov_l])
+      result = search(1 => %w[ov_blue], 2 => %w[ov_xl ov_l])
 
-    expect(scope).to have_received(:with_option_value_ids).with(%w[ov_blue ov_xl ov_l])
-    expect(result.products.map(&:prefixed_id)).to eq(%w[prod_2])
+      expect(scope).to have_received(:with_option_value_ids).with(%w[ov_blue ov_xl ov_l])
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_2])
+    end
+
+    it 'still asks Typesense for the per-type pre-filter' do
+      allow(scope).to receive(:with_option_value_ids).and_return(scope)
+
+      search(1 => %w[ov_blue], 2 => %w[ov_xl])
+
+      expect(client.searches.sole[:filter_by]).to include('option_value_ids:=ov_blue', 'option_value_ids:=ov_xl')
+    end
   end
 
-  it 'still asks Typesense for the per-type pre-filter' do
-    allow(scope).to receive(:with_option_value_ids).and_return(scope)
+  # Spree 6 documents carry one token per combination of a variant's values,
+  # so Typesense answers "blue AND XL" exactly: full pages, exact totals (#10).
+  context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'asks Typesense for the combinations, and leaves the scope alone' do
+      allow(scope).to receive(:with_option_value_ids)
 
-    search(1 => %w[ov_blue], 2 => %w[ov_xl])
+      result = search(1 => %w[ov_blue], 2 => %w[ov_xl ov_l])
 
-    expect(client.searches.sole[:filter_by]).to include('option_value_ids:=ov_blue', 'option_value_ids:=ov_xl')
+      expect(client.searches.sole[:filter_by])
+        .to include('option_value_combination_ids:=[`ov_blue|ov_xl`,`ov_blue|ov_l`]')
+      expect(client.searches.sole[:filter_by]).not_to include('option_value_ids:=')
+      expect(scope).not_to have_received(:with_option_value_ids)
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_1 prod_2 prod_3])
+    end
+
+    it 'narrows through core when more types are selected than the tokens cover' do
+      allow(scope).to receive(:with_option_value_ids).and_return(FakeScope.new(%w[prod_2]))
+      grouped = (1..7).to_h { |type| [type, ["ov_#{type}"]] }
+
+      result = search(grouped)
+
+      expect(scope).to have_received(:with_option_value_ids).with(grouped.values.flatten)
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_2])
+    end
   end
 
   # One type is a union of values, which the index answers exactly.

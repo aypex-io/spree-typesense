@@ -180,6 +180,37 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       expect(document('en', 'USD')[:option_value_ids]).to eq(%w[optv_red optv_large])
     end
 
+    # One token per set of two or more values one variant carries, so a
+    # filter on values of several types can match a single variant (#10).
+    describe 'option value combinations' do
+      def option(id) = FakeCatalog::Option.new(prefixed_id: id, labels: { 'en' => id })
+      def variant(*ids) = FakeCatalog::Variant.new(option_values: ids.map { |id| option(id) })
+
+      def combinations_of(*variants)
+        priced = FakeCatalog::Product.new(prefixed_id: 'prod_v', names: { 'en' => 'V' }, prices: { 'USD' => 1 },
+                                          variants: variants)
+        described_class.new(priced, store).call.first[:option_value_combination_ids]
+      end
+
+      it 'emits the values of each variant, sorted and joined' do
+        expect(document('en', 'USD')[:option_value_combination_ids]).to eq(%w[optv_large|optv_red])
+      end
+
+      it 'never combines values that sit on different variants' do
+        expect(combinations_of(variant('ov_blue', 'ov_s'), variant('ov_red', 'ov_xl'), variant('ov_blue', 'ov_xl')))
+          .to contain_exactly('ov_blue|ov_s', 'ov_red|ov_xl', 'ov_blue|ov_xl')
+      end
+
+      it 'emits every set of two or more values of a variant' do
+        expect(combinations_of(variant('ov_blue', 'ov_s', 'ov_new')))
+          .to contain_exactly('ov_blue|ov_s', 'ov_blue|ov_new', 'ov_new|ov_s', 'ov_blue|ov_new|ov_s')
+      end
+
+      it 'emits none for variants with fewer than two values' do
+        expect(combinations_of(variant('ov_blue'), variant)).to eq([])
+      end
+    end
+
     it 'emits only storefront-visible searchable or sortable custom fields' do
       expect(document('en', 'USD').select { |k, _| k.to_s.start_with?('cf_') })
         .to eq('cf_material' => 'Cotton', 'cf_weight' => 250.0)
@@ -197,12 +228,12 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       expect(document('en', 'USD')[:collection_ids]).to eq(%w[coll_summer coll_linen])
     end
 
-    it 'emits the same field names as on 5.6.1, plus collection_ids' do
+    it 'emits the same field names as on 5.6.1, plus collection_ids and option_value_combination_ids' do
       expect(document('en', 'USD').keys).to eq(
         %i[id product_id locale currency name description slug price compare_at_price status sku in_stock preorder
            store_ids channel_ids discontinue_on category_ids category_names collection_ids option_type_ids
-           option_type_names option_value_ids option_values tags units_sold_count available_on created_at
-           updated_at] +
+           option_type_names option_value_ids option_value_combination_ids option_values tags units_sold_count
+           available_on created_at updated_at] +
         %w[cf_material cf_weight]
       )
     end
