@@ -21,7 +21,9 @@ module SpreeTypesense
   # plain-text description, plus `collection_ids` for the in_collection filter.
   # Those sources sit behind the private seams below.
   #
-  # Left out on purpose (later work): membership documents for manual sort.
+  # On 6.x documents also carry, beyond spree_meilisearch's fields, a
+  # `pos_<grouping prefixed id>` field per collection and category, where
+  # spree_meilisearch writes a membership document per grouping instead.
   class ProductPresenter
     attr_reader :product, :store
 
@@ -146,7 +148,11 @@ module SpreeTypesense
         created_at: product.created_at&.iso8601,
         updated_at: product.updated_at&.iso8601
       )
-      document.merge(custom_field_document_attributes)
+      document.merge!(custom_field_document_attributes)
+      # 6.x only: the merchant's position in each grouping, for a manual
+      # listing to sort by inside Typesense.
+      document.merge!(position_fields) if SpreeTypesense.spree_6?
+      document
     end
 
     # --- 5.x / 6.0 source seams -------------------------------------------
@@ -264,6 +270,34 @@ module SpreeTypesense
 
     def variant_option_values_data
       @variant_option_values_data ||= option_value_variants.flat_map(&:option_values).uniq
+    end
+
+    # `pos_<prefixed id>` => position, for each collection the product is in,
+    # and for each category it is in and every ancestor of it. A product
+    # under a category AND one of its descendants takes the lowest position
+    # in the subtree, as core's Database provider orders a category page
+    # (`MIN(position)` over the subtree) and spree_meilisearch's
+    # `category_positions` do. A membership without a position adds nothing.
+    def position_fields
+      @position_fields ||= collection_positions.merge(category_positions).to_h do |prefixed_id, position|
+        ["pos_#{prefixed_id}", position]
+      end
+    end
+
+    def collection_positions
+      product.product_collections.each_with_object({}) do |membership, acc|
+        acc[membership.collection.prefixed_id] = membership.position unless membership.position.nil?
+      end
+    end
+
+    def category_positions
+      product.product_categories.each_with_object({}) do |membership, acc|
+        next if membership.position.nil?
+
+        membership.category.self_and_ancestors.each do |category|
+          acc[category.prefixed_id] = [acc[category.prefixed_id], membership.position].compact.min
+        end
+      end
     end
 
     # One token per set of two or more option values that sit on the SAME

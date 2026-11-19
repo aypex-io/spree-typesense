@@ -137,8 +137,26 @@ module Spree
           end
         end
 
-        def sort_by(sort_param)
+        # The Typesense sort for the API's sort param. On Spree 6, a listing of
+        # one collection or category in the merchant's order ('manual', or no
+        # sort there, whatever the text query, as core's Database provider
+        # decides) sorts by the product's position in it; the collection wins
+        # when both are given, as in core's `manual_sort_grouping`. 'manual'
+        # with no single grouping, and 5.x, keep the default ranking.
+        def sort_by(sort_param, filters = {})
+          if SpreeTypesense.spree_6? && (sort_param.blank? || sort_param.to_s == 'manual')
+            grouping = manual_grouping(filters)
+            return "pos_#{grouping}:asc" if grouping
+          end
+
           SORT_MAP[sort_param.to_s]
+        end
+
+        def manual_grouping(filters)
+          f = filters.respond_to?(:to_unsafe_h) ? filters.to_unsafe_h : (filters || {}).to_h
+          f = f.transform_keys(&:to_s)
+          id = [f['in_collection'], f['in_category']].find { |value| valid_id?(value) }
+          sanitize_id(id) if id
         end
 
         def valid_id?(value)  = PREFIXED_ID_PATTERN.match?(value.to_s)

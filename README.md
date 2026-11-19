@@ -79,12 +79,16 @@ and with it the documents of products that were deleted or left the scope.
 
 ## Known limitations
 
-- **Manual (position) sort.** The index carries no positions. On Spree 6, a
-  single category or collection listing in manual order (`sort` omitted or
-  `manual`) with no text query is answered by the `Database` provider, which
-  orders it by position. With a text query the order is relevance. On Spree 5,
-  whose `Database` provider applies no position order through the Store API,
-  `manual` is Typesense's default ranking.
+- **Manual (position) sort uses one field per grouping.** On Spree 6 each
+  document carries `pos_<prefixed id>`, the product's position in each
+  collection and category it belongs to (an ancestor category takes the
+  lowest position below it), and a single category or collection listing in
+  manual order (`sort` omitted or `manual`, with or without a text query, as
+  core decides) sorts by it inside Typesense. Each grouping adds a field to
+  the collection's schema, which suits catalogues with hundreds or a few
+  thousand groupings. A grouping no indexed document has a position in yet
+  is answered by the `Database` provider. On Spree 5, whose documents carry
+  no positions (as core's did not), `manual` is Typesense's default ranking.
 - **Facets don't apply buyer-catalog narrowing.** Facet counts come from the
   index and the filters given. A category or collection page's own grouping is
   applied (the filters endpoint passes it), but narrowing made only to the

@@ -70,8 +70,8 @@ module Spree
 
       # 'manual' is the merchant's own order, as the Database provider offers
       # it (Taxon/Collection::SORT_ORDERS). On Spree 6 a manually sorted
-      # category or collection listing is served by the Database provider; see
-      # #manual_sort_listing?.
+      # category or collection listing sorts by the product's position in it
+      # (QueryBuilder.sort_by).
       AVAILABLE_SORT_OPTIONS = %w[manual price -price name -name -available_on available_on best_selling].freeze
 
       # Spree 5.6's Spree::Api::V3::ProductFilterSortOptionSerializer declares
@@ -227,12 +227,6 @@ module Spree
       # around it, by the Database provider or the authorized scope, still
       # raise, as do errors that are not Typesense failing.
       def search_and_filter(scope:, query: nil, filters: {}, sort: nil, page: 1, limit: 25)
-        if manual_sort_listing?(query: query, filters: filters, sort: sort)
-          return fallback_provider.search_and_filter(
-            scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit
-          )
-        end
-
         begin
           search_with_typesense(scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit)
         rescue Unavailable => e
@@ -253,7 +247,8 @@ module Spree
         base, grouped = build_conditions(filters)
         option_conditions, exact = QueryBuilder.option_conditions(grouped)
         result = request_typesense do
-          execute_search(query: query, conditions: base + option_conditions, sort: sort, page: page, limit: limit)
+          execute_search(query: query, conditions: base + option_conditions, sort: sort, page: page, limit: limit,
+                         filters: filters)
         end
 
         product_ids = result['hits'].map { |h| h['document']['product_id'] }.uniq
@@ -472,9 +467,10 @@ module Spree
       end
 
       # The Typesense request; callers wrap it in #request_typesense.
-      def execute_search(query:, conditions:, sort:, page:, limit:, facet_by: nil)
+      def execute_search(query:, conditions:, sort:, page:, limit:, facet_by: nil, filters: {})
         search_client.collections[collection_name].documents.search(
-          search_params(query: query, conditions: conditions, sort: sort, page: page, limit: limit, facet_by: facet_by)
+          search_params(query: query, conditions: conditions, sort: sort, page: page, limit: limit, facet_by: facet_by,
+                        filters: filters)
         )
       end
 
@@ -610,25 +606,7 @@ module Spree
         direction == 'desc' ? "-#{field}" : field
       end
 
-      # Whether this is a single category or collection listing in the
-      # merchant's manual order, with no text query. Spree 6's Database
-      # provider orders those by position, the sort being 'manual' or omitted
-      # there (`manual_sort_grouping`); the index carries no positions, so
-      # #search_and_filter hands them to it. A text query keeps relevance, and
-      # several categories have no single position to follow.
-      #
-      # Spree 5's Database provider applies no position order through this
-      # API, so on 5.x a listing stays on Typesense.
-      def manual_sort_listing?(query:, filters:, sort:)
-        return false unless SpreeTypesense.spree_6?
-        return false if query.present?
-        return false unless sort.blank? || sort.to_s == 'manual'
-
-        f = normalize_filters(filters)
-        QueryBuilder.valid_id?(f['in_collection']) || QueryBuilder.valid_id?(f['in_category'])
-      end
-
-      def search_params(query:, conditions:, sort:, page:, limit:, facet_by: nil)
+      def search_params(query:, conditions:, sort:, page:, limit:, facet_by: nil, filters: {})
         params = {
           q: query.presence || '*',
           query_by: Schema::SEARCHABLE_FIELDS.join(','),
@@ -636,7 +614,8 @@ module Spree
           page: page,
           per_page: limit
         }
-        params[:sort_by] = QueryBuilder.sort_by(sort) if QueryBuilder.sort_by(sort)
+        sort_by = QueryBuilder.sort_by(sort, normalize_filters(filters))
+        params[:sort_by] = sort_by if sort_by
         if facet_by
           params[:facet_by] = facet_by
           # Typesense caps facet values at 10 per field by default and truncates
@@ -665,9 +644,22 @@ module Spree
       # when it needs someone to act (see TRANSIENT_ERRORS). Missing
       # configuration is logged and reported once per process: it fails every
       # search the same way until someone sets it.
+      #
+      # A manual listing of a grouping no indexed document has a position in
+      # yet (before the first reindex that writes them, or a grouping with no
+      # indexed product) is refused by Typesense for want of the field. That
+      # is expected and needs nobody: it is logged at info, not reported, and
+      # the Database provider, which sorts by position too, answers it.
       def report_unavailable(error, query)
         if error.is_a?(::Typesense::Error::MissingConfiguration)
           return unless UNCONFIGURED_LOGGED.make_true
+        end
+        if unindexed_position_sort?(error)
+          Rails.logger.info do
+            "[spree_typesense] no indexed document has a position here yet (#{error.message}); answering this " \
+            'manual listing from the Database provider'
+          end
+          return
         end
 
         Rails.logger.error do
@@ -677,6 +669,10 @@ module Spree
         severity = TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) } ? :warning : :error
         Rails.error.report(error, handled: true, severity: severity,
                                   context: { collection: collection_name, query: query })
+      end
+
+      def unindexed_position_sort?(error)
+        error.is_a?(::Typesense::Error::ObjectNotFound) && error.message.to_s.include?('field named `pos_')
       end
 
       # Typesense alters a live collection in place: PATCH /collections/:name

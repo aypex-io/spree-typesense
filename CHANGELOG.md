@@ -54,6 +54,16 @@
   are full and totals exact; core's `with_option_value_ids` narrowing now
   applies only beyond six types or 1000 combinations, and on Spree 5.x.
 
+- **Category and collection listings in manual order are sorted by
+  Typesense** (#5). On Spree 6 documents carry `pos_<grouping prefixed id>`,
+  the product's position in each collection and category (an ancestor
+  category takes the lowest position below it, as core's `MIN(position)`
+  does), declared by the schema pattern `pos_.*`. A listing of one grouping
+  in manual order (`sort` omitted or `manual`, now with a text query too, as
+  core's Database provider decides) sorts by it instead of being handed to
+  the `Database` provider. A grouping no indexed document has a position in
+  yet still falls back, quietly.
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from

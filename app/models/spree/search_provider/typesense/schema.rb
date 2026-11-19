@@ -56,6 +56,13 @@ module Spree
               # offered. Optional because 5.x documents never carry it.
               { name: 'collection_ids', type: 'string[]', facet: false, optional: true },
 
+              # Spree 6.x only: the product's position in each collection and
+              # category it belongs to, `pos_<prefixed id>` (an ancestor
+              # category takes the lowest position below it). A manual listing
+              # of one grouping sorts by its field. Declared by pattern, so
+              # each grouping's field appears as documents carry it.
+              { name: 'pos_.*', type: 'int32', facet: false, optional: true, sort: true },
+
               { name: 'option_type_ids',   type: 'string[]', facet: false, optional: true },
               { name: 'option_type_names', type: 'string[]', facet: false, optional: true },
               { name: 'option_value_ids',  type: 'string[]', facet: true,  optional: true },
