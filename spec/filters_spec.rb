@@ -74,7 +74,7 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters' do
 
     expect(narrowed.total_count).to eq(2)
     expect(narrowed.filters.find { |f| f[:id] == 'availability' }[:options])
-      .to contain_exactly({ id: 'in_stock', count: 2 })
+      .to contain_exactly({ id: 'in_stock', count: 2 }, { id: 'out_of_stock', count: 0 })
     expect(narrowed.filters.find { |f| f[:id] == 'price' }).to include(min: 10.0, max: 30.0)
   end
 
