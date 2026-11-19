@@ -27,8 +27,8 @@ Then select the provider by environment:
 Spree.search_provider = 'Spree::SearchProvider::Typesense' if ENV['TYPESENSE_URL'].present?
 ```
 
-Requires `TYPESENSE_URL` and `TYPESENSE_API_KEY`. `TYPESENSE_SEARCH_TIMEOUT`
-(seconds, default `2`) is optional; see
+Requires `TYPESENSE_URL` and `TYPESENSE_API_KEY`. `TYPESENSE_SEARCH_TIMEOUT`,
+`TYPESENSE_BREAKER_THRESHOLD` and `TYPESENSE_BREAKER_SECONDS` are optional; see
 [When Typesense is unavailable](#when-typesense-is-unavailable).
 
 Then build the index: `bin/rake spree:search:reindex`.
@@ -58,6 +58,22 @@ no retry, so a hung node costs a shopper about 2 seconds before the fallback
 answers. Set `TYPESENSE_SEARCH_TIMEOUT` (in seconds, e.g. `1.5`) to change it.
 Indexing keeps a 5 second timeout and one retry, and Spree's index jobs retry
 on failure.
+
+During an outage each process stops trying after a while. After three
+transient failures in a row (timeouts, 5xx, lost connections) it skips
+Typesense for 30 seconds: searches and facets answer from the `Database`
+provider at once, with nothing logged per search. Opening is logged once at
+error level and reported once through `Rails.error` as a warning
+(`Spree::SearchProvider::Typesense::CircuitOpened`). Then one search probes
+Typesense; if it answers, searches go back to it, and if not, it waits
+another 30 seconds. Errors that need someone to act (a rejected query, a
+missing collection, a bad key, missing configuration) never open it.
+
+| Variable | Default | |
+|---|---|---|
+| `TYPESENSE_SEARCH_TIMEOUT` | `2` | seconds a search waits for Typesense |
+| `TYPESENSE_BREAKER_THRESHOLD` | `3` | transient failures in a row that open the breaker |
+| `TYPESENSE_BREAKER_SECONDS` | `30` | seconds searches skip Typesense once it opens |
 
 ## Reindexing
 

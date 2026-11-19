@@ -65,6 +65,10 @@ module Spree
       end
       private_constant :Unavailable
 
+      # Reported once when the circuit breaker opens: Typesense has failed
+      # transiently several times in a row, and searches skip it for a while.
+      class CircuitOpened < StandardError; end
+
       # Set once missing configuration has been logged; see #report_unavailable.
       UNCONFIGURED_LOGGED = Concurrent::AtomicBoolean.new(false)
 
@@ -227,13 +231,13 @@ module Spree
       # around it, by the Database provider or the authorized scope, still
       # raise, as do errors that are not Typesense failing.
       def search_and_filter(scope:, query: nil, filters: {}, sort: nil, page: 1, limit: 25)
-        begin
-          search_with_typesense(scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit)
-        rescue Unavailable => e
-          report_unavailable(e.error, query)
+        fallback = lambda do
           fallback_provider.search_and_filter(
             scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit
           )
+        end
+        answer_through_breaker(query, fallback) do
+          search_with_typesense(scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit)
         end
       end
 
@@ -279,19 +283,17 @@ module Spree
       # Database provider, which computes the same ones from the database.
       # As in #search_and_filter, only the Typesense requests are covered.
       def filters(scope:, query: nil, filters: {})
-        result, distribution, stats = begin
-          execute_faceted_search(query: query, filters: filters)
-        rescue Unavailable => e
-          report_unavailable(e.error, query)
-          return fallback_provider.filters(scope: scope, query: query, filters: filters)
-        end
+        fallback = -> { fallback_provider.filters(scope: scope, query: query, filters: filters) }
+        answer_through_breaker(query, fallback) do
+          result, distribution, stats = execute_faceted_search(query: query, filters: filters)
 
-        FiltersResult.new(
-          filters: Facets.build(distribution, currency: currency, stats: stats),
-          sort_options: sort_options_payload,
-          default_sort: default_sort_for(filters),
-          total_count: result['found'] || 0
-        )
+          FiltersResult.new(
+            filters: Facets.build(distribution, currency: currency, stats: stats),
+            sort_options: sort_options_payload,
+            default_sort: default_sort_for(filters),
+            total_count: result['found'] || 0
+          )
+        end
       end
 
       # Composite ids mean one product maps to N documents (locale × currency),
@@ -629,6 +631,53 @@ module Spree
         end
         params
       end
+
+      # Answers through Typesense unless the circuit breaker says it is
+      # failing, in which case `fallback` (the Database provider) answers at
+      # once, with nothing logged. A transient failure counts towards opening
+      # it, and the one that opens it is announced once; anything else
+      # Typesense answered, even with an error, counts as it answering.
+      # Missing configuration made no request and counts as neither. Errors
+      # that are not Typesense's propagate, and free the probe if this was it.
+      def answer_through_breaker(query, fallback)
+        breaker = circuit_breaker
+        return fallback.call unless breaker.allow_request?
+
+        begin
+          answer = yield
+        rescue Unavailable => e
+          record_unavailable(breaker, e.error)
+          report_unavailable(e.error, query)
+          return fallback.call
+        rescue StandardError
+          breaker.release_probe
+          raise
+        end
+
+        Rails.logger.info { '[spree_typesense] Typesense is answering again' } if breaker.record_success == :closed
+        answer
+      end
+
+      def record_unavailable(breaker, error)
+        if error.is_a?(::Typesense::Error::MissingConfiguration)
+          breaker.release_probe
+        elsif TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) }
+          announce_circuit_opened(breaker, error) if breaker.record_failure == :opened
+        elsif breaker.record_success == :closed
+          Rails.logger.info { '[spree_typesense] Typesense is answering again' }
+        end
+      end
+
+      def announce_circuit_opened(breaker, error)
+        message = "Typesense failed #{breaker.threshold} times in a row (last: #{error.class}: #{error.message}); " \
+                  "skipping it for #{breaker.open_seconds.to_s.delete_suffix('.0')} seconds and answering searches " \
+                  'from the Database provider'
+        Rails.logger.error { "[spree_typesense] #{message}" }
+        Rails.error.report(CircuitOpened.new(message), handled: true, severity: :warning,
+                                                      context: { collection: collection_name })
+      end
+
+      def circuit_breaker = SpreeTypesense::CircuitBreaker.for(ENV.fetch('TYPESENSE_URL', ''))
 
       # Runs a Typesense request, raising Unavailable in place of any failure
       # in UNAVAILABLE_ERRORS. Wrap only the request itself: whatever the block

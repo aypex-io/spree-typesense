@@ -64,6 +64,15 @@
   the `Database` provider. A grouping no indexed document has a position in
   yet still falls back, quietly.
 
+- **Searches skip Typesense for a while after it fails** (#8). After three
+  transient failures in a row (timeouts, 5xx, lost connections), a process
+  answers searches and facets from the `Database` provider at once for 30
+  seconds, logging and reporting the outage once
+  (`Spree::SearchProvider::Typesense::CircuitOpened`), then lets one search
+  probe Typesense. Set `TYPESENSE_BREAKER_THRESHOLD` and
+  `TYPESENSE_BREAKER_SECONDS` to change them. Errors that need someone to
+  act never open it. Indexing is unaffected.
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from
