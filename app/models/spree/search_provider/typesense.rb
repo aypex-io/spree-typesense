@@ -596,13 +596,15 @@ module Spree
         f.transform_keys(&:to_s)
       end
 
-      # The sort a listing starts on, as Spree 6's FiltersAggregator and
-      # Meilisearch provider derive it: the collection's own sort order, given
-      # in the API's form ('price desc' -> '-price'), and 'manual' otherwise.
-      # Only 6.x's filters endpoint passes `_collection`.
+      # The sort a listing starts on, as core's FiltersAggregator derives it:
+      # the collection's own sort order on Spree 6 (only 6.x passes
+      # `_collection`; its categories are manual only), the category's on
+      # Spree 5.x, given in the API's form ('price desc' -> '-price'), and
+      # 'manual' otherwise.
       def default_sort_for(filters)
-        collection = normalize_filters(filters)['_collection']
-        sort_order = collection.sort_order.presence if collection.respond_to?(:sort_order)
+        f = normalize_filters(filters)
+        grouping = f['_collection'] || (f['_category'] unless SpreeTypesense.spree_6?)
+        sort_order = grouping.sort_order.presence if grouping.respond_to?(:sort_order)
         field, direction = (sort_order || DEFAULT_SORT).to_s.split(' ', 2)
         direction == 'desc' ? "-#{field}" : field
       end

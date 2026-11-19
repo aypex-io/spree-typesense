@@ -75,6 +75,31 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
       end
     end
 
+    # Core 5.x's FiltersAggregator defaults a category page to the
+    # category's own sort order (`to_api_sort(@category&.sort_order ||
+    # 'manual')`). Spree 6 categories are manual only.
+    describe 'on a category page' do
+      def category(sort_order) = Struct.new(:sort_order, :prefixed_id).new(sort_order, 'ctg_tea')
+
+      def default_for(sort_order)
+        provider.filters(scope: FakeScope.new([]), filters: { '_category' => category(sort_order) }).default_sort
+      end
+
+      context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
+        { 'price desc' => '-price', 'name asc' => 'name', nil => 'manual' }.each do |sort_order, api_sort|
+          it "defaults a category sorted #{sort_order.inspect} to #{api_sort.inspect}" do
+            expect(default_for(sort_order)).to eq(api_sort)
+          end
+        end
+      end
+
+      context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+        it "ignores the category's sort order" do
+          expect(default_for('price desc')).to eq('manual')
+        end
+      end
+    end
+
     it 'reads a symbol-keyed _collection too' do
       result = provider.filters(scope: FakeScope.new([]), filters: { _collection: collection('price desc') })
 

@@ -40,6 +40,13 @@
   A hyphenated locale (`en-US`) and a UUID store id now reach Typesense as
   one backtick-quoted value, as channel ids already did.
 
+- **Facets on category and collection pages count only that grouping** (#6).
+  The filters endpoint passes the page's category (and, on Spree 6, its
+  collection); its facets and total now cover that grouping instead of the
+  whole store. Buyer-catalog narrowing is still not mirrored.
+- **Spree 5.x category pages default to the category's sort order** (#11), as
+  core 5.x's `FiltersAggregator` does, instead of `manual`.
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from
