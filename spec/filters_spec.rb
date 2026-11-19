@@ -60,6 +60,22 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters' do
     )
   end
 
+  # A category page's filters endpoint passes the category; its facets and
+  # total cover that category only, not the whole store (#6).
+  it 'counts facets only within the category the filters endpoint passes' do
+    provider.index_batch([doc('prod_1', price: 10.0, in_stock: true).merge('category_ids' => %w[ctg_tea]),
+                          doc('prod_2', price: 50.0, in_stock: false).merge('category_ids' => %w[ctg_coffee]),
+                          doc('prod_3', price: 30.0, in_stock: true).merge('category_ids' => %w[ctg_tea])])
+    tea = Struct.new(:prefixed_id, :sort_order).new('ctg_tea', nil)
+
+    narrowed = provider.filters(scope: FakeScope.new(%w[prod_1 prod_2 prod_3]), filters: { '_category' => tea })
+
+    expect(narrowed.total_count).to eq(2)
+    expect(narrowed.filters.find { |f| f[:id] == 'availability' }[:options])
+      .to contain_exactly({ id: 'in_stock', count: 2 })
+    expect(narrowed.filters.find { |f| f[:id] == 'price' }).to include(min: 10.0, max: 30.0)
+  end
+
   # The Database provider computes the same facets; fallback_spec.rb covers
   # each kind of failure.
   it 'answers from the Database provider when the engine errors' do

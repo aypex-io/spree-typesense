@@ -85,11 +85,12 @@ and with it the documents of products that were deleted or left the scope.
   orders it by position. With a text query the order is relevance. On Spree 5,
   whose `Database` provider applies no position order through the Store API,
   `manual` is Typesense's default ranking.
-- **Facets don't apply catalog narrowing.** Facet counts come from the index
-  and the filters given, not from the product `scope` the filters endpoint
-  passes, so narrowing applied only to that scope is not reflected: Spree 6's
-  buyer catalogs, and a `category_id` sent without an `in_category` filter.
-  Search results are always intersected with the scope.
+- **Facets don't apply buyer-catalog narrowing.** Facet counts come from the
+  index and the filters given. A category or collection page's own grouping is
+  applied (the filters endpoint passes it), but narrowing made only to the
+  product `scope`, such as Spree 6's buyer catalogs and audiences, is not:
+  the index cannot express it. Spree's Meilisearch provider has the same
+  limit. Search results are always intersected with the scope.
 - **Some filters and sorts are ignored.** The index answers `price_gte`,
   `price_lte`, `in_stock`, `out_of_stock`, `in_category`, `in_categories`,
   `in_collection` (Spree 6) and `with_option_value_ids`. It ignores

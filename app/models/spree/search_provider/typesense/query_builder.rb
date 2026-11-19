@@ -77,7 +77,19 @@ module Spree
             "collection_ids:=#{sanitize_id(value)}" if SpreeTypesense.spree_6? && valid_id?(value)
           when 'with_option_value_ids'
             nil # handled by grouped_option_conditions
+          # The records the filters endpoint passes on a category or (Spree 6)
+          # collection page, so facets and the total cover that grouping only.
+          when '_category'
+            grouping_condition('category_ids', value)
+          when '_collection'
+            grouping_condition('collection_ids', value) if SpreeTypesense.spree_6?
           end
+        end
+
+        def grouping_condition(field, record)
+          return unless record.respond_to?(:prefixed_id) && valid_id?(record.prefixed_id)
+
+          "#{field}:=#{sanitize_id(record.prefixed_id)}"
         end
 
         # OR within an option type, AND across option types.

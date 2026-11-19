@@ -156,6 +156,26 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
       end
     end
 
+    # The filters endpoint passes the category and (Spree 6) collection
+    # records of a category or collection page; facets count only within it.
+    describe 'the grouping records the filters endpoint passes' do
+      def record(prefixed_id) = Struct.new(:prefixed_id).new(prefixed_id)
+
+      it 'narrows to the _category' do
+        expect(described_class.condition_for('_category', record('ctg_tea'))).to eq('category_ids:=ctg_tea')
+      end
+
+      it 'ignores a _category without a well-formed prefixed id' do
+        expect(described_class.condition_for('_category', record('ctg_x || status:=draft'))).to be_nil
+        expect(described_class.condition_for('_category', 'ctg_tea')).to be_nil
+      end
+
+      it 'narrows to the _collection on Spree 6, and ignores it on 5.x' do
+        expected = SpreeTypesense.spree_6? ? 'collection_ids:=coll_new' : nil
+        expect(described_class.condition_for('_collection', record('coll_new'))).to eq(expected)
+      end
+    end
+
     it 'ignores with_option_value_ids (handled by grouped conditions)' do
       expect(described_class.user_conditions(with_option_value_ids: %w[ov_a])).to be_empty
     end
