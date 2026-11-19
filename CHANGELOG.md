@@ -1,5 +1,20 @@
 # Changelog
 
+## 6.0.1 (unreleased)
+
+- **Reindex no longer orders the scope it batches** (#21). `find_in_batches`
+  ignores a scoped order, so Rails logged "Scoped order is ignored" on every
+  reindex, and an app with `error_on_ignored_order` failed every reindex.
+- **Overlapping reindexes** (#22): the one that started last goes live. An
+  earlier one that finds the `__building` marker taken when it ends (or
+  fails) drops its collection, leaves the live alias and the marker alone,
+  and returns 0. It used to go live without the writes made since the newer
+  one started, and remove the newer one's marker.
+- **A product saved during a reindex keeps its newer documents** (#23). A
+  batch read before the save left out that product's documents rather than
+  overwrite the ones the save wrote into the new collection, which used to
+  go live with the older ones.
+
 ## 6.0.0 (2026-11-19)
 
 The first release as **spree-typesense** (`gem 'spree-typesense', '~> 6.0'`),
