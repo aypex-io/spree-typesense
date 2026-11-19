@@ -235,12 +235,14 @@ RSpec.describe 'Typesense engine behaviours the 0.3.0 layout relies on' do
       expect(collection_names).to include('probe_legacy', 'probe_legacy_v1')
     end
 
-    it 'leaves imports and searches by that name on the alias target' do
+    # So a 0.2.0 rollback rebuilds a real collection that then serves, and
+    # the next 0.3.0 reindex must treat it as the legacy collection.
+    it 'takes imports and searches by that name itself, ahead of the alias' do
       make('probe_legacy')
       ts.collections['probe_legacy'].documents.import([{ 'id' => 'y', 'n' => 1 }], action: 'upsert')
 
-      expect(ids(ts.collections['probe_legacy_v1'].documents.search(q: '*'))).to eq(['y'])
       expect(ids(ts.collections['probe_legacy'].documents.search(q: '*'))).to eq(['y'])
+      expect(ids(ts.collections['probe_legacy_v1'].documents.search(q: '*'))).to eq([])
     end
   end
 
