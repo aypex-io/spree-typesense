@@ -75,6 +75,31 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
       end
     end
 
+    # Core 5.x's FiltersAggregator defaults a category page to the
+    # category's own sort order (`to_api_sort(@category&.sort_order ||
+    # 'manual')`). Spree 6 categories are manual only.
+    describe 'on a category page' do
+      def category(sort_order) = Struct.new(:sort_order, :prefixed_id).new(sort_order, 'ctg_tea')
+
+      def default_for(sort_order)
+        provider.filters(scope: FakeScope.new([]), filters: { '_category' => category(sort_order) }).default_sort
+      end
+
+      context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
+        { 'price desc' => '-price', 'name asc' => 'name', nil => 'manual' }.each do |sort_order, api_sort|
+          it "defaults a category sorted #{sort_order.inspect} to #{api_sort.inspect}" do
+            expect(default_for(sort_order)).to eq(api_sort)
+          end
+        end
+      end
+
+      context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+        it "ignores the category's sort order" do
+          expect(default_for('price desc')).to eq('manual')
+        end
+      end
+    end
+
     it 'reads a symbol-keyed _collection too' do
       result = provider.filters(scope: FakeScope.new([]), filters: { _collection: collection('price desc') })
 
@@ -83,75 +108,68 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
   end
 
   # Spree 6's Database provider orders a single category or collection by the
-  # merchant's positions when the sort is 'manual', or omitted there. The
-  # index carries no positions, so those listings go to the Database provider.
+  # merchant's positions when the sort is 'manual', or omitted there, whatever
+  # the text query. Spree 6 documents carry `pos_<grouping id>`, so Typesense
+  # sorts those listings itself (#5).
   describe '#search_and_filter on a manually sorted listing' do
-    let(:database_result) { instance_double(Spree::SearchProvider::SearchResult) }
-    let(:database) { instance_double(Spree::SearchProvider::Database, search_and_filter: database_result) }
+    let(:database) { instance_double(Spree::SearchProvider::Database, search_and_filter: :database_result) }
     let(:scope) { FakeScope.new([]) }
 
     before { allow(Spree::SearchProvider::Database).to receive(:new).and_return(database) }
 
     def search(**args) = provider.search_and_filter(scope: scope, page: 2, limit: 10, **args)
+    def sort_sent = client.searches.sole[:sort_by]
 
     context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
       [
-        [{ 'in_category' => 'ctg_a' }, nil],
-        [{ 'in_category' => 'ctg_a' }, ''],
-        [{ 'in_collection' => 'coll_a' }, nil],
-        [{ 'in_collection' => 'coll_a' }, 'manual'],
-        [{ in_collection: 'coll_a', 'price_gte' => '5' }, 'manual']
-      ].each do |filters, sort|
-        it "hands #{filters.inspect} sorted #{sort.inspect} to the Database provider, unchanged" do
-          expect(search(filters: filters, sort: sort)).to be(database_result)
-          expect(database).to have_received(:search_and_filter)
-            .with(scope: scope, query: nil, filters: filters, sort: sort, page: 2, limit: 10)
-          expect(client.searches).to be_empty
+        [{ 'in_category' => 'ctg_a' }, nil, 'pos_ctg_a:asc'],
+        [{ 'in_category' => 'ctg_a' }, '', 'pos_ctg_a:asc'],
+        [{ 'in_collection' => 'coll_a' }, nil, 'pos_coll_a:asc'],
+        [{ 'in_collection' => 'coll_a' }, 'manual', 'pos_coll_a:asc'],
+        [{ in_collection: 'coll_a', 'price_gte' => '5' }, 'manual', 'pos_coll_a:asc']
+      ].each do |filters, sort, sort_by|
+        it "sorts #{filters.inspect} sorted #{sort.inspect} by #{sort_by} in Typesense" do
+          search(filters: filters, sort: sort)
+
+          expect(sort_sent).to eq(sort_by)
+          expect(database).not_to have_received(:search_and_filter)
         end
       end
 
-      it 'builds the Database provider with this provider\'s audience' do
-        provider = described_class.new(store, audience: nil)
-        allow(provider).to receive(:search_client).and_return(client)
+      it 'sorts by position under a text query too, as core does' do
+        search(query: 'tea', filters: { 'in_category' => 'ctg_a' })
 
-        provider.search_and_filter(scope: scope, filters: { 'in_category' => 'ctg_a' })
+        expect(sort_sent).to eq('pos_ctg_a:asc')
+      end
 
-        expect(Spree::SearchProvider::Database).to have_received(:new).with(store, audience: nil)
+      it 'follows the collection when a collection and a category are both given, as core does' do
+        search(filters: { 'in_category' => 'ctg_a', 'in_collection' => 'coll_b' })
+
+        expect(sort_sent).to eq('pos_coll_b:asc')
       end
     end
 
-    # Each of these stays on Typesense: a text query ranks by relevance, a
-    # field sort is Typesense's to apply, and without one grouping 'manual'
-    # has no positions to follow even in the Database provider.
+    # A field sort is Typesense's to apply, and without one grouping 'manual'
+    # has no positions to follow.
     [
-      ['a text query', { query: 'tea', filters: { 'in_collection' => 'coll_a' }, sort: 'manual' }],
-      ['a field sort', { filters: { 'in_collection' => 'coll_a' }, sort: 'price' }],
-      ["'manual' with no grouping", { sort: 'manual' }],
-      ['several categories', { filters: { 'in_categories' => %w[ctg_a ctg_b] } }],
-      ['an invalid grouping id', { filters: { 'in_category' => 'ctg_a || x' } }]
-    ].each do |description, args|
-      it "keeps #{description} on Typesense" do
+      ['a field sort', { filters: { 'in_collection' => 'coll_a' }, sort: 'price' }, 'price:asc'],
+      ["'manual' with no grouping", { sort: 'manual' }, nil],
+      ['several categories', { filters: { 'in_categories' => %w[ctg_a ctg_b] } }, nil],
+      ['an invalid grouping id', { filters: { 'in_category' => 'ctg_a || x' } }, nil]
+    ].each do |description, args, sort_by|
+      it "sends #{description} #{sort_by ? "sorted by #{sort_by}" : 'with no sort'}" do
         search(**args)
 
-        expect(database).not_to have_received(:search_and_filter)
-        expect(client.searches.size).to eq(1)
+        expect(sort_sent).to eq(sort_by)
       end
     end
 
-    it 'leaves the order to relevance for a text query under a manual sort' do
-      search(query: 'tea', filters: { 'in_collection' => 'coll_a' }, sort: 'manual')
-
-      expect(client.searches.sole).not_to have_key(:sort_by)
-    end
-
-    # Spree 5's Database provider applies no position order through this API,
-    # so handing it a listing would only lose Typesense's ranking.
+    # Spree 5 documents carry no positions, as core 5.x's did not.
     context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
-      it 'keeps a category listing on Typesense' do
+      it "keeps Typesense's ranking for a category listing" do
         search(filters: { 'in_category' => 'ctg_a' })
 
-        expect(database).not_to have_received(:search_and_filter)
-        expect(client.searches.size).to eq(1)
+        expect(sort_sent).to be_nil
       end
     end
   end
@@ -184,21 +202,49 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests across option 
     provider.search_and_filter(scope: scope, filters: { 'with_option_value_ids' => grouped.values.flatten })
   end
 
-  it 'narrows the scope through core when values of two option types are selected' do
-    allow(scope).to receive(:with_option_value_ids).and_return(FakeScope.new(%w[prod_2]))
+  context 'on Spree 5.x', unless: SpreeTypesense.spree_6? do
+    it 'narrows the scope through core when values of two option types are selected' do
+      allow(scope).to receive(:with_option_value_ids).and_return(FakeScope.new(%w[prod_2]))
 
-    result = search(1 => %w[ov_blue], 2 => %w[ov_xl ov_l])
+      result = search(1 => %w[ov_blue], 2 => %w[ov_xl ov_l])
 
-    expect(scope).to have_received(:with_option_value_ids).with(%w[ov_blue ov_xl ov_l])
-    expect(result.products.map(&:prefixed_id)).to eq(%w[prod_2])
+      expect(scope).to have_received(:with_option_value_ids).with(%w[ov_blue ov_xl ov_l])
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_2])
+    end
+
+    it 'still asks Typesense for the per-type pre-filter' do
+      allow(scope).to receive(:with_option_value_ids).and_return(scope)
+
+      search(1 => %w[ov_blue], 2 => %w[ov_xl])
+
+      expect(client.searches.sole[:filter_by]).to include('option_value_ids:=ov_blue', 'option_value_ids:=ov_xl')
+    end
   end
 
-  it 'still asks Typesense for the per-type pre-filter' do
-    allow(scope).to receive(:with_option_value_ids).and_return(scope)
+  # Spree 6 documents carry one token per combination of a variant's values,
+  # so Typesense answers "blue AND XL" exactly: full pages, exact totals (#10).
+  context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'asks Typesense for the combinations, and leaves the scope alone' do
+      allow(scope).to receive(:with_option_value_ids)
 
-    search(1 => %w[ov_blue], 2 => %w[ov_xl])
+      result = search(1 => %w[ov_blue], 2 => %w[ov_xl ov_l])
 
-    expect(client.searches.sole[:filter_by]).to include('option_value_ids:=ov_blue', 'option_value_ids:=ov_xl')
+      expect(client.searches.sole[:filter_by])
+        .to include('option_value_combination_ids:=[`ov_blue|ov_xl`,`ov_blue|ov_l`]')
+      expect(client.searches.sole[:filter_by]).not_to include('option_value_ids:=')
+      expect(scope).not_to have_received(:with_option_value_ids)
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_1 prod_2 prod_3])
+    end
+
+    it 'narrows through core when more types are selected than the tokens cover' do
+      allow(scope).to receive(:with_option_value_ids).and_return(FakeScope.new(%w[prod_2]))
+      grouped = (1..7).to_h { |type| [type, ["ov_#{type}"]] }
+
+      result = search(grouped)
+
+      expect(scope).to have_received(:with_option_value_ids).with(grouped.values.flatten)
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_2])
+    end
   end
 
   # One type is a union of values, which the index answers exactly.

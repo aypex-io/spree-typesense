@@ -69,7 +69,8 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       created_at: Time.utc(2023, 5, 6),
       updated_at: Time.utc(2024, 7, 8),
       custom_fields: custom_fields,
-      collections: [FakeCatalog::Collection.new('coll_summer'), FakeCatalog::Collection.new('coll_linen')]
+      collections: [FakeCatalog::Collection.new('coll_summer'), FakeCatalog::Collection.new('coll_linen')],
+      positions: { 'coll_summer' => 3, 'coll_linen' => 1, 'ctg_shirts' => 4, 'ctg_sale' => 2 }
     )
   end
 
@@ -163,6 +164,10 @@ RSpec.describe SpreeTypesense::ProductPresenter do
     it 'emits no collection_ids: 5.x has no collections' do
       expect(document('en', 'USD')).not_to have_key(:collection_ids)
     end
+
+    it 'emits no positions, as core 5.x does not' do
+      expect(document('en', 'USD').keys.grep(/\Apos_/)).to eq([])
+    end
   end
 
   context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
@@ -178,6 +183,37 @@ RSpec.describe SpreeTypesense::ProductPresenter do
 
     it 'indexes option values from variants' do
       expect(document('en', 'USD')[:option_value_ids]).to eq(%w[optv_red optv_large])
+    end
+
+    # One token per set of two or more values one variant carries, so a
+    # filter on values of several types can match a single variant (#10).
+    describe 'option value combinations' do
+      def option(id) = FakeCatalog::Option.new(prefixed_id: id, labels: { 'en' => id })
+      def variant(*ids) = FakeCatalog::Variant.new(option_values: ids.map { |id| option(id) })
+
+      def combinations_of(*variants)
+        priced = FakeCatalog::Product.new(prefixed_id: 'prod_v', names: { 'en' => 'V' }, prices: { 'USD' => 1 },
+                                          variants: variants)
+        described_class.new(priced, store).call.first[:option_value_combination_ids]
+      end
+
+      it 'emits the values of each variant, sorted and joined' do
+        expect(document('en', 'USD')[:option_value_combination_ids]).to eq(%w[optv_large|optv_red])
+      end
+
+      it 'never combines values that sit on different variants' do
+        expect(combinations_of(variant('ov_blue', 'ov_s'), variant('ov_red', 'ov_xl'), variant('ov_blue', 'ov_xl')))
+          .to contain_exactly('ov_blue|ov_s', 'ov_red|ov_xl', 'ov_blue|ov_xl')
+      end
+
+      it 'emits every set of two or more values of a variant' do
+        expect(combinations_of(variant('ov_blue', 'ov_s', 'ov_new')))
+          .to contain_exactly('ov_blue|ov_s', 'ov_blue|ov_new', 'ov_new|ov_s', 'ov_blue|ov_new|ov_s')
+      end
+
+      it 'emits none for variants with fewer than two values' do
+        expect(combinations_of(variant('ov_blue'), variant)).to eq([])
+      end
     end
 
     it 'emits only storefront-visible searchable or sortable custom fields' do
@@ -197,14 +233,61 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       expect(document('en', 'USD')[:collection_ids]).to eq(%w[coll_summer coll_linen])
     end
 
-    it 'emits the same field names as on 5.6.1, plus collection_ids' do
-      expect(document('en', 'USD').keys).to eq(
+    it 'emits the same field names as on 5.6.1, plus collection_ids and option_value_combination_ids' do
+      expect(document('en', 'USD').keys.reject { |key| key.to_s.start_with?('pos_') }).to eq(
         %i[id product_id locale currency name description slug price compare_at_price status sku in_stock preorder
            store_ids channel_ids discontinue_on category_ids category_names collection_ids option_type_ids
-           option_type_names option_value_ids option_values tags units_sold_count available_on created_at
-           updated_at] +
+           option_type_names option_value_ids option_value_combination_ids option_values tags units_sold_count
+           available_on created_at updated_at] +
         %w[cf_material cf_weight]
       )
+    end
+
+    # The merchant's position in each collection and category, for a manual
+    # listing to sort by inside Typesense (#5).
+    describe 'positions' do
+      def positions(document) = document.select { |key, _| key.to_s.start_with?('pos_') }
+
+      it 'emits the position in each collection' do
+        expect(positions(document('en', 'USD'))).to include('pos_coll_summer' => 3, 'pos_coll_linen' => 1)
+      end
+
+      it 'emits the position in each category and, as the lowest below it, in each ancestor' do
+        expect(positions(document('en', 'USD')))
+          .to include('pos_ctg_shirts' => 4, 'pos_ctg_sale' => 2, 'pos_ctg_apparel' => 2)
+      end
+
+      def positioned_in(positions)
+        teas = FakeCatalog::Category.new(prefixed_id: 'ctg_teas', names: { 'en' => 'Teas' }, parent: apparel)
+        green = FakeCatalog::Category.new(prefixed_id: 'ctg_green', names: { 'en' => 'Green' }, parent: teas)
+        tea = FakeCatalog::Product.new(prefixed_id: 'prod_tea', names: { 'en' => 'Tea' }, prices: { 'USD' => 1 },
+                                       categories: [teas, green], positions: positions)
+        self.positions(described_class.new(tea, store).call.first)
+      end
+
+      it "gives an ancestor the lowest of its own and its descendants' positions" do
+        expect(positioned_in('ctg_teas' => 5, 'ctg_green' => 2))
+          .to eq('pos_ctg_teas' => 2, 'pos_ctg_green' => 2, 'pos_ctg_apparel' => 2)
+        expect(positioned_in('ctg_teas' => 1, 'ctg_green' => 4))
+          .to eq('pos_ctg_teas' => 1, 'pos_ctg_green' => 4, 'pos_ctg_apparel' => 1)
+      end
+
+      it 'emits nothing for a membership without a position' do
+        expect(positioned_in({})).to eq({})
+      end
+
+      # Spree 6 removes a deleted category's or collection's memberships in a
+      # later job (`dependent: :destroy_async`); until then they point at
+      # nothing, and must not fail the product's indexing.
+      it 'skips a membership whose collection or category is gone' do
+        orphaned = FakeCatalog::Product.new(prefixed_id: 'prod_orphan', names: { 'en' => 'Orphan' }, prices: { 'USD' => 1 })
+        allow(orphaned).to receive(:product_collections).and_return(
+          [FakeCatalog::Membership.new(nil, 1), FakeCatalog::Membership.new(FakeCatalog::Collection.new('coll_x'), 2)]
+        )
+        allow(orphaned).to receive(:product_categories).and_return([FakeCatalog::Membership.new(nil, 1)])
+
+        expect(positions(described_class.new(orphaned, store).call.first)).to eq('pos_coll_x' => 2)
+      end
     end
 
     it 'never reads the names 6.0 deprecated' do
@@ -218,6 +301,59 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       expect(product).not_to have_received(:variants_including_master)
       expect(product).not_to have_received(:metafields)
     end
+
+    # Outside a request Spree reads a translated attribute's base column only
+    # in the application's default locale, so a store written in another
+    # locale was indexed with blank names (fixed in core's own presenter in
+    # Spree 6.0.5). These fakes do not model Mobility's column fallback, so
+    # the examples check that the presenter names the store's locale while it
+    # reads, not that a real record's names then come out.
+    context "when the store's locale is not the application's" do
+      let(:nl) { FakeCatalog::Market.new(currency: 'EUR', supported_locales_list: %w[nl en], default_locale: 'nl') }
+      let(:dutch_store) do
+        FakeCatalog::Store.new(id: 7, code: 'dutch', markets: [nl], default_market: nl,
+                               supported_currencies_list: [FakeCatalog::Currency.new('EUR')])
+      end
+      let(:bicycle) do
+        FakeCatalog::Product.new(prefixed_id: 'prod_bike', names: { 'nl' => 'Fiets', 'en' => 'Bicycle' },
+                                 prices: { 'EUR' => BigDecimal('300') })
+      end
+
+      it "reads the product in the store's content locale, and restores the content locale after" do
+        content_locales = []
+        allow(bicycle).to receive(:name).and_wrap_original do |original, **kwargs|
+          content_locales << Spree::Current.content_locale
+          original.call(**kwargs)
+        end
+        before = Spree::Current.attributes[:content_locale]
+
+        described_class.new(bicycle, dutch_store).call
+
+        expect(content_locales.uniq).to eq(['nl'])
+        expect(Spree::Current.attributes[:content_locale]).to eq(before)
+      end
+
+      it 'restores the content locale when a document fails to build' do
+        allow(bicycle).to receive(:name).and_raise(RuntimeError, 'boom')
+        before = Spree::Current.attributes[:content_locale]
+
+        expect { described_class.new(bicycle, dutch_store).call }.to raise_error(RuntimeError, 'boom')
+        expect(Spree::Current.attributes[:content_locale]).to eq(before)
+      end
+
+      context 'and no market to build documents for' do
+        let(:no_markets) do
+          FakeCatalog::Store.new(id: 7, code: 'dutch', markets: [], default_market: nl,
+                                 supported_currencies_list: [FakeCatalog::Currency.new('EUR')])
+        end
+
+        it "indexes one document in the store's locale, read in that locale" do
+          documents = described_class.new(bicycle, no_markets).call
+
+          expect(documents.map { |d| d.values_at(:locale, :name) }).to eq([%w[nl Fiets]])
+        end
+      end
+    end
   end
 
   # Whichever version is under test, its documents must import cleanly into
@@ -227,8 +363,8 @@ RSpec.describe SpreeTypesense::ProductPresenter do
     let(:collection) { provider.client.collections[provider.collection_name] }
 
     before do
-      collection.delete rescue nil
-      provider.ensure_index_settings!
+      reset_typesense_index!(store.code)
+      bootstrap_index!(provider)
     end
 
     it 'accepts every document and field' do

@@ -21,8 +21,9 @@ module SpreeTypesense
   # plain-text description, plus `collection_ids` for the in_collection filter.
   # Those sources sit behind the private seams below.
   #
-  # Left out on purpose (later work): membership documents for manual sort,
-  # and `option_value_combination_ids`.
+  # On 6.x documents also carry, beyond spree_meilisearch's fields, a
+  # `pos_<grouping prefixed id>` field per collection and category, where
+  # spree_meilisearch writes a membership document per grouping instead.
   class ProductPresenter
     attr_reader :product, :store
 
@@ -34,6 +35,14 @@ module SpreeTypesense
     # Returns an array of documents — one per market × locale combination.
     # Each document has flat name, description, price fields (no dynamic suffixes).
     def call
+      # Indexing runs in a job or a rake task, where nothing has named the
+      # locale the base columns are written in.
+      with_store_content_locale { build_documents }
+    end
+
+    private
+
+    def build_documents
       documents = []
 
       market_locale_pairs.each do |market, locale|
@@ -48,15 +57,45 @@ module SpreeTypesense
       # Fallback for stores without markets (legacy/test)
       if documents.empty?
         fallback_currency = store.default_market&.currency || store.supported_currencies_list.first&.iso_code
-        if fallback_currency && lowest_price(fallback_currency)
-          documents << build_document(default_locale, fallback_currency, default_locale)
-        end
+        documents << fallback_document(fallback_currency) if fallback_currency && lowest_price(fallback_currency)
       end
 
       documents
     end
 
-    private
+    # Spree 6 reads a translated attribute from its base column only in
+    # `Spree::Current.content_locale`, the locale the store's content is
+    # written in. A request sets that to the store's locale; a job or a rake
+    # task leaves it at the application's default. So for a store whose
+    # default market locale is not the application's (`nl` beside `en`), every
+    # name, description and slug read here came out blank, and the product
+    # could not be found by name. Spree 6.0.5 fixed its own presenter
+    # (spree/spree#15226) by naming the store's locale with
+    # `Spree::Current.with_content_locale`; this does the same, and on 6.0.0
+    # to 6.0.4, which lack that helper, sets and restores the attribute itself.
+    #
+    # On 5.x the documents stay as core's presenter builds them.
+    def with_store_content_locale(&block)
+      return yield unless SpreeTypesense.spree_6?
+      return Spree::Current.with_content_locale(default_locale, &block) if Spree::Current.respond_to?(:with_content_locale)
+
+      previous = Spree::Current.attributes[:content_locale]
+      Spree::Current.content_locale = default_locale.to_s
+      begin
+        yield
+      ensure
+        Spree::Current.content_locale = previous
+      end
+    end
+
+    # On 6.x the document is read in the locale it is labelled with, as in
+    # Spree 6.0.5's presenter, rather than in whatever locale the job runs in.
+    # On 5.x it is read as core's presenter reads it.
+    def fallback_document(currency)
+      return build_document(default_locale, currency, default_locale) unless SpreeTypesense.spree_6?
+
+      Mobility.with_locale(default_locale) { build_document(default_locale, currency, default_locale) }
+    end
 
     # Key order follows core's 5.6.1 presenter, so documents compare equal
     # field by field and serialise identically.
@@ -96,7 +135,12 @@ module SpreeTypesense
       document.merge!(
         option_type_ids: product.option_types.map(&:prefixed_id),
         option_type_names: product.option_types.map { |ot| translated(ot, label_attribute, fallback_locale) },
-        option_value_ids: variant_option_value_ids,
+        option_value_ids: variant_option_value_ids
+      )
+      # 6.x only, where several option types must match one variant; placed
+      # as in spree_meilisearch 6.0's document.
+      document[:option_value_combination_ids] = variant_option_value_combination_ids if SpreeTypesense.spree_6?
+      document.merge!(
         option_values: variant_option_values_data.map { |ov| translated(ov, label_attribute, fallback_locale) }.uniq,
         tags: product.tag_list || [],
         units_sold_count: product.units_sold_count || 0,
@@ -104,7 +148,11 @@ module SpreeTypesense
         created_at: product.created_at&.iso8601,
         updated_at: product.updated_at&.iso8601
       )
-      document.merge(custom_field_document_attributes)
+      document.merge!(custom_field_document_attributes)
+      # 6.x only: the merchant's position in each grouping, for a manual
+      # listing to sort by inside Typesense.
+      document.merge!(position_fields) if SpreeTypesense.spree_6?
+      document
     end
 
     # --- 5.x / 6.0 source seams -------------------------------------------
@@ -222,6 +270,56 @@ module SpreeTypesense
 
     def variant_option_values_data
       @variant_option_values_data ||= option_value_variants.flat_map(&:option_values).uniq
+    end
+
+    # `pos_<prefixed id>` => position, for each collection the product is in,
+    # and for each category it is in and every ancestor of it. A product
+    # under a category AND one of its descendants takes the lowest position
+    # in the subtree, as core's Database provider orders a category page
+    # (`MIN(position)` over the subtree) and spree_meilisearch's
+    # `category_positions` do. A membership without a position adds nothing,
+    # nor does one whose collection or category is gone: Spree 6 removes a
+    # deleted grouping's memberships in a later job (`destroy_async`).
+    def position_fields
+      @position_fields ||= collection_positions.merge(category_positions).to_h do |prefixed_id, position|
+        ["pos_#{prefixed_id}", position]
+      end
+    end
+
+    def collection_positions
+      product.product_collections.each_with_object({}) do |membership, acc|
+        collection = membership.collection
+        next if collection.nil? || membership.position.nil?
+
+        acc[collection.prefixed_id] = membership.position
+      end
+    end
+
+    def category_positions
+      product.product_categories.each_with_object({}) do |membership, acc|
+        grouping = membership.category
+        next if grouping.nil? || membership.position.nil?
+
+        grouping.self_and_ancestors.each do |category|
+          acc[category.prefixed_id] = [acc[category.prefixed_id], membership.position].compact.min
+        end
+      end
+    end
+
+    # One token per set of two or more option values that sit on the SAME
+    # variant, as spree_meilisearch 6.0.5 writes them. `option_value_ids` is a
+    # union across variants, so it cannot tell a product selling a blue XL
+    # from one selling a blue S beside a red XL; a token per whole set can.
+    # Sets reach MAX_COMBINATION_AXES values: the count grows exponentially,
+    # and a filter across more types falls back to core's narrowing.
+    def variant_option_value_combination_ids
+      max_axes = Spree::SearchProvider::Typesense::QueryBuilder::MAX_COMBINATION_AXES
+      product.variants.flat_map do |variant|
+        ids = variant.option_values.map(&:prefixed_id)
+        (2..[ids.size, max_axes].min).flat_map do |size|
+          ids.combination(size).map { |set| Spree::SearchProvider::Typesense::QueryBuilder.combination_token(set) }
+        end
+      end.uniq
     end
   end
 end

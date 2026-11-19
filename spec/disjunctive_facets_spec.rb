@@ -26,12 +26,18 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
       'name' => "Product #{pid}", 'status' => 'active', 'in_stock' => true,
       'store_ids' => ['7'], 'discontinue_on' => 0, 'units_sold_count' => 0,
       'price' => 10.0, 'option_value_ids' => option_value_ids,
+      'option_value_combination_ids' => single_variant_tokens(option_value_ids),
       'available_on' => '2020-01-01T00:00:00Z', 'created_at' => '2020-01-01T00:00:00Z' }
   end
 
+  # The tokens a product with one variant carrying all these values gets.
+  def single_variant_tokens(ids)
+    (2..ids.size).flat_map { |n| ids.combination(n).map { |c| described_class::QueryBuilder.combination_token(c) } }
+  end
+
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch([
@@ -88,8 +94,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
     end
 
     before do
-      provider.client.collections[provider.collection_name].delete rescue nil
-      provider.ensure_index_settings!
+      reset_typesense_index!(store.code)
+      bootstrap_index!(provider)
       provider.index_batch([
         doc('prod_1', %w[ov_red ov_small]),
         doc('prod_2', %w[ov_red ov_large]),
@@ -109,6 +115,10 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
     it 'relaxes only the facet\'s own type, keeping other types applied' do
       colour_counts = result.filters.find { |f| f[:id] == 'optt_colour' }[:options].to_h { |o| [o[:id], o[:count]] }
       expect(colour_counts).to eq('ov_red' => 1, 'ov_blue' => 1)
+    end
+
+    it 'counts only the products with a variant of both selected values' do
+      expect(result.total_count).to eq(1)
     end
 
     # Size counts drop the size filter but KEEP colour=red:

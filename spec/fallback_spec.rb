@@ -235,6 +235,98 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
     end
   end
 
+  # During an outage every search would wait out the timeout before falling
+  # back. After three transient failures in a row the process skips Typesense
+  # for a while and answers from the Database provider at once (#8).
+  describe 'the circuit breaker' do
+    let(:now) { [1_000.0] }
+    let(:breaker) { SpreeTypesense::CircuitBreaker.new(threshold: 3, open_seconds: 30, clock: -> { now.first }) }
+    let(:client) { RecordingTypesenseClient.new { raise Typesense::Error::TimeoutError, 'timed out' } }
+
+    before do
+      allow(SpreeTypesense::CircuitBreaker).to receive(:for).and_return(breaker)
+      allow(provider).to receive(:search_client).and_return(client)
+    end
+
+    def search = provider.search_and_filter(scope: scope, query: 'tea')
+
+    it 'skips Typesense once it has failed three times in a row, answering from the Database provider' do
+      3.times { search }
+
+      expect(search).to eq(:database_search)
+      expect(provider.filters(scope: scope)).to eq(:database_filters)
+      expect(client.requests.size).to eq(3)
+    end
+
+    it 'says so once when it opens, and nothing for the searches it skips' do
+      3.times { search }
+      logged_at_open = errors_logged.size
+      reported_at_open = reported.size
+
+      2.times { search }
+
+      expect(errors_logged.grep(/skipping it for 30/).size).to eq(1)
+      expect(reported.count { |error, severity| error.is_a?(described_class::CircuitOpened) && severity == :warning })
+        .to eq(1)
+      expect(errors_logged.size).to eq(logged_at_open)
+      expect(reported.size).to eq(reported_at_open)
+    end
+
+    it 'probes Typesense again after 30 seconds, and closes once it answers' do
+      3.times { search }
+      now[0] += 30
+      allow(provider).to receive(:search_client).and_return(RecordingTypesenseClient.new)
+
+      search
+
+      expect(breaker.state).to eq(:closed)
+    end
+
+    # A rejected query, a missing collection or a bad key will not pass by
+    # waiting; they are reported as errors on every search instead.
+    it 'never opens on errors that need someone to act' do
+      allow(provider).to receive(:search_client).and_return(
+        RecordingTypesenseClient.new { raise Typesense::Error::RequestMalformed, 'bad filter' }
+      )
+
+      5.times { search }
+
+      expect(breaker.state).to eq(:closed)
+      expect(reported.map(&:last)).to eq([:error] * 5)
+    end
+
+    it 'never opens without configuration, which makes no request' do
+      allow(provider).to receive(:search_client).and_call_original
+
+      with_env('TYPESENSE_URL' => nil) { 5.times { search } }
+
+      expect(breaker.state).to eq(:closed)
+    end
+
+    it 'recovers when the probe is killed by an exception outside StandardError' do
+      killed = Class.new(Exception) # rubocop:disable Lint/InheritException
+      3.times { search }
+      now[0] += 30
+      allow(provider).to receive(:search_client).and_return(RecordingTypesenseClient.new { raise killed })
+      expect { search }.to raise_error(killed)
+
+      now[0] += 30
+      allow(provider).to receive(:search_client).and_return(RecordingTypesenseClient.new)
+      search
+
+      expect(breaker.state).to eq(:closed)
+    end
+
+    it 'lets the next request probe when the probe raised an error that is not Typesense failing' do
+      3.times { search }
+      now[0] += 30
+      allow(provider).to receive(:search_client).and_return(RecordingTypesenseClient.new { raise NoMethodError, 'bug' })
+
+      expect { search }.to raise_error(NoMethodError)
+      expect(breaker.allow_request?).to be(true)
+    end
+  end
+
   # Typesense answers multi_search with HTTP 200 and an error per failed
   # search, so a failed facet query raises nothing on its own.
   it 'answers facets from the Database provider when a disjunctive sub-search fails' do
@@ -283,16 +375,6 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
       expect(errors_logged).to be_empty
     end
 
-    context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
-      it 'lets an error from the Database hand-off of a manually sorted listing propagate' do
-        allow(database).to receive(:search_and_filter).and_raise(Errno::ECONNREFUSED)
-
-        expect { provider.search_and_filter(scope: scope, filters: { 'in_category' => 'ctg_a' }) }
-          .to raise_error(Errno::ECONNREFUSED)
-        expect(database).to have_received(:search_and_filter).once
-        expect(errors_logged).to be_empty
-      end
-    end
   end
 
   # Unconfigured is unavailable too: no 500 from a KeyError on every search.

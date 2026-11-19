@@ -5,8 +5,8 @@ RSpec.describe Spree::SearchProvider::Typesense do
   let(:provider) { described_class.new(store) }
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!('shop')
+    bootstrap_index!(provider)
   end
 
   it 'requires background indexing' do
@@ -18,8 +18,15 @@ RSpec.describe Spree::SearchProvider::Typesense do
   # `rake spree:search:reindex` an upgrade runs is enough. Driven against the
   # real server, starting from the schema a 0.1.x release created.
   describe '#ensure_index_settings! against an already-existing collection' do
-    let(:collection) { provider.client.collections[provider.collection_name] }
     let(:schema) { Spree::SearchProvider::Typesense::Schema }
+    let(:layout) { Spree::SearchProvider::Typesense::IndexLayout.new(typesense_client, 'shop') }
+
+    # The collection the live name serves from: a real one (0.1.x/0.2.0
+    # layout) when it exists, else the alias's target.
+    def collection
+      name = layout.legacy_collection? ? layout.live_name : layout.alias_target(layout.live_name)
+      provider.client.collections[name]
+    end
 
     def doc(product_id, **extra)
       { 'id' => "#{product_id}_en_USD", 'product_id' => product_id, 'locale' => 'en', 'currency' => 'USD',
@@ -32,7 +39,7 @@ RSpec.describe Spree::SearchProvider::Typesense do
 
     # 0.1.x declared every field but collection_ids.
     def create_collection_as_0_1_did
-      collection.delete rescue nil
+      reset_typesense_index!('shop')
       legacy = schema.definition(provider.collection_name)
       legacy[:fields] = legacy[:fields].reject { |f| f[:name] == 'collection_ids' }
       provider.client.collections.create(legacy)
@@ -112,7 +119,7 @@ RSpec.describe Spree::SearchProvider::Typesense do
     # Typesense cannot retype a field in place. Say which field, and what to
     # do, rather than leaving the operator to find out from failed imports.
     it 'warns, naming the field and the remedy, when a live field has another type, and leaves it' do
-      collection.delete rescue nil
+      reset_typesense_index!('shop')
       drifted = schema.definition(provider.collection_name)
       drifted[:fields] = drifted[:fields].map { |f| f[:name] == 'units_sold_count' ? f.merge(type: 'int64') : f }
       provider.client.collections.create(drifted)
@@ -120,7 +127,7 @@ RSpec.describe Spree::SearchProvider::Typesense do
 
       provider.ensure_index_settings!
 
-      expect(warnings.join(' ')).to include('units_sold_count', 'int64', 'int32', 'drop', 'reindex')
+      expect(warnings.join(' ')).to include('units_sold_count', 'int64', 'int32', 'reindex', 'fresh collection')
       expect(live_fields.find { |f| f['name'] == 'units_sold_count' }['type']).to eq('int64')
     end
   end
@@ -230,6 +237,67 @@ RSpec.describe Spree::SearchProvider::Typesense do
     end
   end
 
+  # Two index jobs for one product can overlap. Each deletes the product's
+  # documents it did not produce, but only those written before it read the
+  # product, so an older job finishing last cannot drop what a newer job
+  # wrote (#9).
+  describe 'overlapping index jobs for one product' do
+    let(:collection) { provider.client.collections[provider.collection_name] }
+
+    def job_doc(locale, currency)
+      { id: "prod_j_#{locale}_#{currency}", product_id: 'prod_j', locale: locale, currency: currency,
+        status: 'active', name: 'Product j', price: 1.0, in_stock: true, store_ids: ['1'],
+        discontinue_on: 0, units_sold_count: 0, created_at: '2024-01-01T00:00:00Z' }
+    end
+
+    # Runs one index job that read the product at `read_at`.
+    def job(read_at, documents)
+      presenter_class = class_double('SpreeTypesense::ProductPresenter')
+      allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: documents) }
+      allow(provider).to receive(:presenter_class).and_return(presenter_class)
+      allow(provider).to receive(:current_time_ms).and_return(read_at)
+      provider.index(FakeProduct.new('prod_j'))
+    end
+
+    def stored_ids
+      collection.documents.search(q: '*', per_page: 100)['hits'].map { |h| h['document']['id'] }
+    end
+
+    it 'stamps every document with the time the product was read' do
+      job(1_800_000_000_000, [job_doc('en', 'USD')])
+
+      expect(collection.documents['prod_j_en_USD'].retrieve['indexed_at']).to eq(1_800_000_000_000)
+    end
+
+    it 'keeps the documents a newer job wrote when an older one finishes last' do
+      job(1_800_000_002_000, [job_doc('en', 'USD'), job_doc('en', 'EUR')])
+      job(1_800_000_001_000, [job_doc('en', 'USD')])
+
+      expect(stored_ids).to contain_exactly('prod_j_en_USD', 'prod_j_en_EUR')
+    end
+
+    it 'removes the documents an older job wrote that the product no longer produces' do
+      job(1_800_000_001_000, [job_doc('en', 'USD'), job_doc('en', 'EUR')])
+      job(1_800_000_002_000, [job_doc('en', 'USD')])
+
+      expect(stored_ids).to contain_exactly('prod_j_en_USD')
+    end
+
+    it 'keeps a newer job\'s documents when an older job finds the product produces none' do
+      job(1_800_000_002_000, [job_doc('en', 'USD')])
+      job(1_800_000_001_000, [])
+
+      expect(stored_ids).to contain_exactly('prod_j_en_USD')
+    end
+
+    it 'removes older documents when a newer job finds the product produces none' do
+      job(1_800_000_001_000, [job_doc('en', 'USD')])
+      job(1_800_000_002_000, [])
+
+      expect(stored_ids).to eq([])
+    end
+  end
+
   it 'removes a document by prefixed id' do
     provider.index_batch([
       { 'id' => 'prod_b_en_USD', 'product_id' => 'prod_b', 'locale' => 'en',
@@ -265,6 +333,99 @@ RSpec.describe Spree::SearchProvider::Typesense do
 
     doc = provider.client.collections[provider.collection_name].documents['prod_e_en_USD'].retrieve
     expect(doc['product_id']).to eq('prod_e')
+  end
+
+  # A reindex marks the collection it is filling `__building`; a product
+  # saved meanwhile must reach it too, or the swap would bring back its old
+  # documents.
+  describe 'single-product writes' do
+    let(:layout) { Spree::SearchProvider::Typesense::IndexLayout.new(typesense_client, 'shop') }
+
+    def ws_doc(product_id)
+      { id: "#{product_id}_en_USD", product_id: product_id, locale: 'en', currency: 'USD', status: 'active',
+        name: "Product #{product_id}", price: 1.0, in_stock: true, store_ids: ['1'], discontinue_on: 0,
+        units_sold_count: 0, created_at: '2024-01-01T00:00:00Z' }
+    end
+
+    def index_as(product_id, documents)
+      presenter_class = class_double('SpreeTypesense::ProductPresenter')
+      allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: documents) }
+      allow(provider).to receive(:presenter_class).and_return(presenter_class)
+      provider.index(FakeProduct.new(product_id))
+    end
+
+    def ids_in(name)
+      typesense_client.collections[name].documents.search(q: '*', per_page: 100)['hits'].map { |h| h['document']['id'] }
+    end
+
+    def store_collections
+      typesense_client.collections.retrieve.map { |c| c['name'] }
+                      .select { |name| name == layout.live_name || layout.version_pattern.match?(name) }
+    end
+
+    describe 'during a reindex' do
+      let(:building) { layout.new_version_name(1_800_000_000_000) }
+
+      before do
+        typesense_client.collections.create(described_class::Schema.definition(building))
+        layout.point!(layout.building_name, building)
+      end
+
+      it 'writes a product to the live and the building collection' do
+        index_as('prod_w', [ws_doc('prod_w')])
+
+        expect(ids_in('products_shop')).to eq(['prod_w_en_USD'])
+        expect(ids_in(building)).to eq(['prod_w_en_USD'])
+      end
+
+      it 'removes a product from both' do
+        index_as('prod_w', [ws_doc('prod_w')])
+        expect(ids_in(building)).to eq(['prod_w_en_USD'])
+
+        provider.remove_by_id('prod_w')
+
+        expect(ids_in('products_shop')).to eq([])
+        expect(ids_in(building)).to eq([])
+      end
+
+      it 'writes to the live collection when the one being built is gone' do
+        layout.drop!(building)
+
+        expect { index_as('prod_w', [ws_doc('prod_w')]) }.not_to raise_error
+        expect(ids_in('products_shop')).to eq(['prod_w_en_USD'])
+      end
+    end
+
+    # Only a reindex creates the index: one product's save creating it would
+    # serve a one-product index, with no fallback, until the next reindex.
+    describe 'with no index yet' do
+      before { reset_typesense_index!('shop') }
+
+      it 'raises ObjectNotFound from #index, and creates nothing' do
+        expect { index_as('prod_n', [ws_doc('prod_n')]) }.to raise_error(Typesense::Error::ObjectNotFound)
+        expect(store_collections).to eq([])
+      end
+
+      it 'creates nothing from #ensure_index_settings!' do
+        provider.ensure_index_settings!
+
+        expect(store_collections).to eq([])
+      end
+    end
+
+    it '#ensure_index_settings! adds a missing field to the collection the alias points at' do
+      reset_typesense_index!('shop')
+      target = layout.new_version_name(1_800_000_000_000)
+      definition = described_class::Schema.definition(target)
+      definition[:fields] = definition[:fields].reject { |f| f[:name] == 'collection_ids' }
+      typesense_client.collections.create(definition)
+      layout.point!(layout.live_name, target)
+
+      provider.ensure_index_settings!
+
+      fields = typesense_client.collections[target].retrieve['fields'].map { |f| f['name'] }
+      expect(fields).to include('collection_ids')
+    end
   end
 
   describe '#derive_fields (private)' do
@@ -307,15 +468,19 @@ RSpec.describe Spree::SearchProvider::Typesense, '#ensure_index_settings! reques
   let(:existing) { instance_double(Typesense::Collection) }
   let(:altered)  { instance_double(Typesense::Collection, update: {}) }
   let(:logged)   { Hash.new { |h, k| h[k] = [] } }
+  let(:target)   { 'products_shop_v1763000000000' }
 
   before do
     collections = instance_double(Typesense::Collections)
-    allow(collections).to receive(:create).and_raise(Typesense::Error::ObjectAlreadyExists, 'already exists')
-    allow(collections).to receive(:[]).with('products_shop').and_return(existing)
-    allow(existing).to receive(:retrieve) { { 'name' => 'products_shop', 'fields' => live_fields } }
+    allow(collections).to receive(:[]).with(target).and_return(existing)
+    allow(existing).to receive(:retrieve) { { 'name' => target, 'fields' => live_fields } }
     allow(provider).to receive(:client).and_return(instance_double(Typesense::Client, collections: collections))
+    allow(provider).to receive(:index_layout).and_return(
+      instance_double(Spree::SearchProvider::Typesense::IndexLayout, live_name: 'products_shop',
+                                                                     legacy_collection?: false, alias_target: target)
+    )
     allow(provider).to receive(:schema_client)
-      .and_return(instance_double(Typesense::Client, collections: { 'products_shop' => altered }))
+      .and_return(instance_double(Typesense::Client, collections: { target => altered }))
 
     logger = Logger.new(File::NULL)
     %i[info warn error].each do |level|
@@ -337,7 +502,7 @@ RSpec.describe Spree::SearchProvider::Typesense, '#ensure_index_settings! reques
     it 'logs which fields it added' do
       provider.ensure_index_settings!
 
-      expect(logged[:info].join(' ')).to include('collection_ids', 'products_shop')
+      expect(logged[:info].join(' ')).to include('collection_ids', target)
     end
 
     # A reindex carrying on would index into a collection that still cannot
@@ -363,7 +528,7 @@ RSpec.describe Spree::SearchProvider::Typesense, '#ensure_index_settings! reques
     it 'warns, naming the field, both types and the remedy, and does not try to change it' do
       provider.ensure_index_settings!
 
-      expect(logged[:warn].join(' ')).to include('units_sold_count', 'int64', 'int32', 'drop', 'reindex')
+      expect(logged[:warn].join(' ')).to include('units_sold_count', 'int64', 'int32', 'reindex', 'fresh collection')
       expect(altered).not_to have_received(:update)
     end
   end
@@ -400,6 +565,9 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
     collection = instance_double(Typesense::Collection, documents: documents)
     allow(provider).to receive(:client)
       .and_return(instance_double(Typesense::Client, collections: { 'products_shop' => collection }))
+    allow(provider).to receive(:index_layout).and_return(
+      instance_double(Spree::SearchProvider::Typesense::IndexLayout, write_targets: ['products_shop'])
+    )
 
     logger = Logger.new(File::NULL)
     %i[info warn error].each do |level|
@@ -416,7 +584,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
 
       expect(provider.index_batch(batch)).to eq(import_results(:ok, :ok, :ok))
       expect(documents).to have_received(:import)
-        .with(batch.map { |d| hash_including('id' => d[:id], 'available_on_i' => 0) }, action: 'upsert')
+        .with(batch.map { |d| hash_including('id' => d[:id], 'available_on_i' => 0, 'indexed_at' => kind_of(Integer)) },
+              action: 'upsert')
     end
 
     it 'raises once the batch is sent, naming every document Typesense rejected' do
@@ -454,6 +623,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
   end
 
   describe '#index' do
+    before { allow(provider).to receive(:current_time_ms).and_return(1_800_000_000_000) }
+
     def index_producing(product_id, produced)
       presenter_class = class_double('SpreeTypesense::ProductPresenter')
       allow(presenter_class).to receive(:new) { instance_double(SpreeTypesense::ProductPresenter, call: produced) }
@@ -468,7 +639,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
 
       expect(documents).to have_received(:import).ordered
       expect(documents).to have_received(:delete)
-        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_en-US_USD`]').ordered
+        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_en-US_USD`] && indexed_at:<1800000000000')
+        .ordered
     end
 
     it 'deletes all of its documents, and imports nothing, when the product produces none' do
@@ -477,7 +649,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
       index_producing('prod_x', [])
 
       expect(documents).not_to have_received(:import)
-      expect(documents).to have_received(:delete).with(filter_by: 'product_id:=prod_x')
+      expect(documents).to have_received(:delete).with(filter_by: 'product_id:=prod_x && indexed_at:<1800000000000')
     end
 
     # The documents Typesense did take are current, so the stale ones still go;
@@ -488,7 +660,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
       expect { index_producing('prod_x', [doc('prod_x_en_USD'), doc('prod_x_de_EUR')]) }
         .to raise_error(described_class::ImportError, /prod_x_de_EUR/)
       expect(documents).to have_received(:delete)
-        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_de_EUR`]')
+        .with(filter_by: 'product_id:=prod_x && id:!=[`prod_x_en_USD`,`prod_x_de_EUR`] && indexed_at:<1800000000000')
     end
 
     # Unreachable: nothing was upserted, so nothing is known to be stale.
@@ -515,7 +687,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'indexing requests' do
 
       index_producing('prod_x || product_id:=prod_y', [])
 
-      expect(documents).to have_received(:delete).with(filter_by: 'product_id:=prod_xproduct_idprod_y')
+      expect(documents).to have_received(:delete)
+        .with(filter_by: 'product_id:=prod_xproduct_idprod_y && indexed_at:<1800000000000')
     end
   end
 end

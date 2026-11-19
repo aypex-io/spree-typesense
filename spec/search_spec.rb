@@ -13,8 +13,8 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
   end
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch([
@@ -34,6 +34,90 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
   it 'never returns another market\'s copy of a product' do
     result = provider.search_and_filter(scope: FakeScope.new(%w[prod_1 prod_3]), query: 'herbal')
     expect(result.products.map(&:prefixed_id)).to eq(%w[prod_1])
+  end
+
+  # Locales such as en-US carry a hyphen, which the locale filter must quote.
+  it 'finds documents in a hyphenated locale' do
+    provider.index_batch([doc('prod_4', name: 'Herbal Tea', locale: 'en-US')])
+    allow(provider).to receive(:locale).and_return('en-US')
+
+    result = provider.search_and_filter(scope: FakeScope.new(%w[prod_1 prod_4]), query: 'herbal')
+
+    expect(result.products.map(&:prefixed_id)).to eq(%w[prod_4])
+  end
+
+  # One product sells blue-S and red-XL, another blue-XL: "blue AND XL" is
+  # only the second, with an exact total, and the scope is never narrowed by
+  # core (FakeScope raises if it is) (#10).
+  context 'on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'filters values of two option types to products with one variant carrying both' do
+      provider.index_batch([
+        doc('prod_a', name: 'Herbal A').merge('option_value_ids' => %w[ov_blue ov_s ov_red ov_xl],
+                                              'option_value_combination_ids' => %w[ov_blue|ov_s ov_red|ov_xl]),
+        doc('prod_b', name: 'Herbal B').merge('option_value_ids' => %w[ov_blue ov_xl],
+                                              'option_value_combination_ids' => %w[ov_blue|ov_xl])
+      ])
+      allow(provider).to receive(:group_option_values_by_type).and_return(1 => %w[ov_blue], 2 => %w[ov_xl])
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_a prod_b]),
+                                          filters: { 'with_option_value_ids' => %w[ov_blue ov_xl] })
+
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_b])
+      expect(result.total_count).to eq(1)
+    end
+  end
+
+  # The merchant's order inside Typesense: documents carry the product's
+  # position in each grouping, and a manual listing sorts by it (#5).
+  context 'a manually sorted listing on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'comes back in the order of the positions' do
+      provider.index_batch([
+        doc('prod_a', name: 'Herbal A').merge('collection_ids' => %w[coll_x], 'pos_coll_x' => 3),
+        doc('prod_b', name: 'Herbal B').merge('collection_ids' => %w[coll_x], 'pos_coll_x' => 1),
+        doc('prod_c', name: 'Herbal C').merge('collection_ids' => %w[coll_x], 'pos_coll_x' => 2)
+      ])
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_a prod_b prod_c]),
+                                          filters: { 'in_collection' => 'coll_x' })
+
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_b prod_c prod_a])
+    end
+
+    # Before the first 0.3.0 reindex, or for a grouping no indexed product
+    # belongs to, no document carries the field: Typesense refuses the sort,
+    # and the Database provider, which sorts by position too, answers. That
+    # is expected, so it is not reported as an error.
+    it 'answers from the Database provider, quietly, while no document carries the position' do
+      provider.index_batch([doc('prod_a', name: 'Herbal A').merge('category_ids' => %w[ctg_x])])
+      database = instance_double(Spree::SearchProvider::Database, search_and_filter: :database_result)
+      allow(Spree::SearchProvider::Database).to receive(:new).and_return(database)
+      allow(Spree::SearchProvider::NULL_ERROR_REPORTER).to receive(:report)
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_a]), filters: { 'in_category' => 'ctg_x' })
+
+      expect(result).to eq(:database_result)
+      expect(Spree::SearchProvider::NULL_ERROR_REPORTER).not_to have_received(:report)
+    end
+  end
+
+  # A filter far longer than Typesense takes in a GET query string (4000
+  # characters): 30 colours by 30 sizes make 900 combination tokens. The
+  # search must still be answered by Typesense, not fall back.
+  context 'a long filter on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'is answered by Typesense' do
+      colours = (1..30).map { |i| "optval_colour#{i.to_s.rjust(4, '0')}" }
+      sizes = (1..30).map { |i| "optval_size#{i.to_s.rjust(4, '0')}" }
+      token = described_class::QueryBuilder.combination_token([colours.first, sizes.first])
+      provider.index_batch([doc('prod_m', name: 'Herbal M').merge('option_value_ids' => [colours.first, sizes.first],
+                                                                  'option_value_combination_ids' => [token])])
+      allow(provider).to receive(:group_option_values_by_type).and_return(1 => colours, 2 => sizes)
+      allow(Spree::SearchProvider::Database).to receive(:new).and_return(instance_double(Spree::SearchProvider::Database))
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_m]),
+                                          filters: { 'with_option_value_ids' => colours + sizes })
+
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_m])
+    end
   end
 
   # THE security test.
@@ -137,8 +221,9 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
   context 'filtering by collection on Spree 6.x', if: SpreeTypesense.spree_6? do
     before do
       provider.index_batch([
-        doc('prod_4', name: 'Herbal Tea', price: 20.0).merge('collection_ids' => %w[coll_summer]),
-        doc('prod_5', name: 'Herbal Gummies', price: 30.0).merge('collection_ids' => %w[coll_summer coll_new])
+        doc('prod_4', name: 'Herbal Tea', price: 20.0).merge('collection_ids' => %w[coll_summer], 'pos_coll_summer' => 2),
+        doc('prod_5', name: 'Herbal Gummies', price: 30.0)
+          .merge('collection_ids' => %w[coll_summer coll_new], 'pos_coll_summer' => 1, 'pos_coll_new' => 1)
       ])
     end
 

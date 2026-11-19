@@ -64,6 +64,13 @@ module FakeCatalog
 
   Collection = Struct.new(:prefixed_id)
 
+  # Spree 6's ProductCollection / ProductCategory: a membership with the
+  # merchant's position.
+  Membership = Struct.new(:grouping, :position) do
+    def collection = grouping
+    def category = grouping
+  end
+
   CustomFieldDefinition = Struct.new(:filter_key, :field_type, :searchable, :sortable, :storefront_visible,
                                      keyword_init: true) do
     # Metafield definitions before 5.6.1 have no search capabilities.
@@ -114,7 +121,8 @@ module FakeCatalog
                    status: 'active', sku: nil, in_stock: true, preorder: false, store_id: 1,
                    channel_ids_by_store_id: {}, discontinue_on: nil, categories: [], option_types: [],
                    variants: [], master: Variant.new(option_values: []), tag_list: [], units_sold_count: 0,
-                   available_on: nil, created_at: nil, updated_at: nil, custom_fields: [], collections: [])
+                   available_on: nil, created_at: nil, updated_at: nil, custom_fields: [], collections: [],
+                   positions: {})
       @prefixed_id = prefixed_id
       @names = names
       @descriptions = descriptions
@@ -139,6 +147,7 @@ module FakeCatalog
       @updated_at = updated_at
       @custom_fields = custom_fields
       @collections = collections
+      @positions = positions
     end
 
     def name(locale: nil) = translate(@names, locale)
@@ -159,9 +168,13 @@ module FakeCatalog
     def variants = @variants
     def custom_fields = @custom_fields
 
-    # Collections are new in Spree 6.0.
+    # Collections, and the memberships Spree 6 orders groupings by, are new
+    # in Spree 6.0. `positions` maps a grouping's prefixed id to the
+    # product's position in it.
     if SpreeTypesense.spree_6?
       def collections = @collections
+      def product_collections = @collections.map { |c| Membership.new(c, @positions[c.prefixed_id]) }
+      def product_categories = @categories.map { |c| Membership.new(c, @positions[c.prefixed_id]) }
     end
 
     def taxons

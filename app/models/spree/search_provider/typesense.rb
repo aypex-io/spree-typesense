@@ -65,13 +65,17 @@ module Spree
       end
       private_constant :Unavailable
 
+      # Reported once when the circuit breaker opens: Typesense has failed
+      # transiently several times in a row, and searches skip it for a while.
+      class CircuitOpened < StandardError; end
+
       # Set once missing configuration has been logged; see #report_unavailable.
       UNCONFIGURED_LOGGED = Concurrent::AtomicBoolean.new(false)
 
       # 'manual' is the merchant's own order, as the Database provider offers
       # it (Taxon/Collection::SORT_ORDERS). On Spree 6 a manually sorted
-      # category or collection listing is served by the Database provider; see
-      # #manual_sort_listing?.
+      # category or collection listing sorts by the product's position in it
+      # (QueryBuilder.sort_by).
       AVAILABLE_SORT_OPTIONS = %w[manual price -price name -name -available_on available_on best_selling].freeze
 
       # Spree 5.6's Spree::Api::V3::ProductFilterSortOptionSerializer declares
@@ -103,14 +107,13 @@ module Spree
         true
       end
 
-      # Creates the collection, or brings an existing one up to
-      # Schema.definition. Called by #reindex, so the plain
-      # `rake spree:search:reindex` an upgrade runs is enough to add the
-      # fields a newer release declares.
+      # Brings the collection the live name serves from up to
+      # Schema.definition in place, adding the fields it lacks. With no index
+      # at all it does nothing: only #reindex creates one, so a store never
+      # serves an index that holds part of its catalogue without falling back.
       def ensure_index_settings!
-        client.collections.create(Schema.definition(collection_name))
-      rescue ::Typesense::Error::ObjectAlreadyExists
-        update_collection_schema!
+        name = live_collection_name
+        update_collection_schema!(name) if name
         nil
       end
 
@@ -119,38 +122,46 @@ module Spree
       # lazy-preloaded associations. Returns the number of DOCUMENTS indexed
       # (not products — one product can emit N locale x currency documents).
       #
+      # Builds a fresh versioned collection from Schema.definition, marked
+      # `__building` while it fills so single-product writes reach it too,
+      # then points the live alias at it and drops what it replaced: the
+      # older versioned collections and a real collection holding the live
+      # name (0.2.0's, or one a rollback to 0.2.0 created). Searches answer
+      # from the previous collection until the swap, and documents of
+      # products that are gone or out of scope go with the old collection.
+      #
+      # The scope becomes the whole index: pass every product the store
+      # should find (the rake task passes store.products). To refresh some
+      # products, use #index for each.
+      #
       # A batch with rejected documents does not stop the reindex, and those
       # documents are not counted. Once every batch is sent, an ImportError
-      # names them all, so `rake spree:search:reindex` fails visibly.
-      #
-      # Documents of products deleted since the last reindex are not removed
-      # here: Spree's removal job deletes them as products are destroyed.
+      # names them all, so `rake spree:search:reindex` fails visibly; the new
+      # collection is then dropped and the live alias left where it was, so
+      # no product goes missing from search. Any other error does the same.
       def reindex(scope = nil)
         scope ||= store.products
-        ensure_index_settings!
+        layout = index_layout
+        building = layout.new_version_name(current_time_ms)
+        client.collections.create(Schema.definition(building))
+        layout.point!(layout.building_name, building)
 
-        indexed = 0
-        failures = []
-        scope.reorder(id: :asc).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
-          documents = batch.flat_map { |product| presenter_class.new(product, store).call }
-          next if documents.empty?
-
-          accepted = documents.size
-          begin
-            index_batch(documents)
-          rescue ImportError => e
-            failures.concat(e.failures)
-            accepted -= e.failures.size
-          end
-          indexed += accepted
-          Rails.logger.info { "[spree_typesense] indexed #{accepted} (#{indexed} total) into #{collection_name}" }
+        begin
+          indexed, failures = index_scope(scope, into: building)
+        rescue StandardError
+          abandon_build(layout, building)
+          raise
         end
 
         Rails.logger.info do
           "[spree_typesense] reindex complete: #{indexed} documents indexed, #{failures.size} failed"
         end
-        raise ImportError.new(collection_name, failures) if failures.any?
+        if failures.any?
+          abandon_build(layout, building)
+          raise ImportError.new(building, failures)
+        end
 
+        swap_live_alias(layout, building)
         indexed
       end
 
@@ -159,19 +170,32 @@ module Spree
       # and a product that lost a currency's price, say, must not stay
       # searchable in that market. A product that produces none loses them all.
       #
+      # Every document is stamped `indexed_at` with the moment the product was
+      # read, and only documents stamped earlier are deleted, so when two jobs
+      # for one product overlap, the older one finishing last cannot drop what
+      # the newer one wrote (#9).
+      #
+      # Writes to the live collection and, while a reindex is filling one, to
+      # that one too, so the change survives the swap. A collection being
+      # built that has since gone (its reindex died) is skipped.
+      #
       # Raises ImportError (after the deletion) when Typesense rejects a
       # document, so the index job retries it.
       def index(product)
+        read_at = current_time_ms
         documents = Array(presenter_class.new(product, store).call)
 
+        results = nil
         rejected = nil
-        begin
-          results = index_batch(documents)
-        rescue ImportError => e
-          rejected = e
+        each_write_target do |target, live|
+          begin
+            batch_results = index_batch(documents, into: target, indexed_at: read_at)
+            results = batch_results if live
+          rescue ImportError => e
+            rejected ||= e
+          end
+          remove_stale_documents(product.prefixed_id, documents, from: target, written_before: read_at)
         end
-
-        remove_stale_documents(product.prefixed_id, documents)
         raise rejected if rejected
 
         results
@@ -182,16 +206,19 @@ module Spree
       # rejection is logged with its document id, and once the whole batch is
       # sent an ImportError names them all.
       #
+      # @param documents [Array<Hash>]
+      # @param into [String] the collection or alias to import into
+      # @param indexed_at [Integer] when the products were read, epoch ms
       # @return [Array<Hash>, nil] Typesense's per-document results
       # @raise [ImportError] when Typesense rejected any document
-      def index_batch(documents)
+      def index_batch(documents, into: collection_name, indexed_at: current_time_ms)
         return if documents.blank?
 
-        documents = documents.map { |d| derive_fields(d) }
-        results = client.collections[collection_name].documents.import(documents, action: 'upsert')
+        documents = documents.map { |d| derive_fields(d, indexed_at) }
+        results = client.collections[into].documents.import(documents, action: 'upsert')
 
-        failures = import_failures(documents, results)
-        raise ImportError.new(collection_name, failures) if failures.any?
+        failures = import_failures(documents, results, into)
+        raise ImportError.new(into, failures) if failures.any?
 
         results
       end
@@ -208,19 +235,13 @@ module Spree
       # around it, by the Database provider or the authorized scope, still
       # raise, as do errors that are not Typesense failing.
       def search_and_filter(scope:, query: nil, filters: {}, sort: nil, page: 1, limit: 25)
-        if manual_sort_listing?(query: query, filters: filters, sort: sort)
-          return fallback_provider.search_and_filter(
-            scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit
-          )
-        end
-
-        begin
-          search_with_typesense(scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit)
-        rescue Unavailable => e
-          report_unavailable(e.error, query)
+        fallback = lambda do
           fallback_provider.search_and_filter(
             scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit
           )
+        end
+        answer_through_breaker(query, fallback) do
+          search_with_typesense(scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit)
         end
       end
 
@@ -232,21 +253,23 @@ module Spree
         limit = limit.to_i.clamp(1, 100)
 
         base, grouped = build_conditions(filters)
+        option_conditions, exact = QueryBuilder.option_conditions(grouped)
         result = request_typesense do
-          execute_search(query: query, conditions: base + QueryBuilder.grouped_option_conditions(grouped),
-                         sort: sort, page: page, limit: limit)
+          execute_search(query: query, conditions: base + option_conditions, sort: sort, page: page, limit: limit,
+                         filters: filters)
         end
 
         product_ids = result['hits'].map { |h| h['document']['product_id'] }.uniq
         raw_ids = product_ids.filter_map { |pid| Spree::Product.decode_prefixed_id(pid) }
 
         # Values of two or more option types must sit on ONE variant, as core's
-        # `Product.with_option_value_ids` decides on Spree 6. The index holds a
-        # product's values as one set, so it only pre-filters; core's scope
-        # gives the exact answer, as in Spree's Meilisearch provider. (On 5.x
-        # core asks it of the product, as the index does, so this agrees.) A
-        # page can then come back short of `limit`, and the total over-counts.
-        scope = scope.with_option_value_ids(grouped.values.flatten) if grouped.size > 1
+        # `Product.with_option_value_ids` decides on Spree 6. Spree 6 documents
+        # carry combination tokens that answer it exactly. Where they cannot
+        # (more types than the tokens cover) and on 5.x (which asks it of the
+        # product, as the index does), the index only pre-filters and core's
+        # scope gives the exact answer, so a page can come back short of
+        # `limit` and the total over-count.
+        scope = scope.with_option_value_ids(grouped.values.flatten) unless exact
 
         # SECURITY: intersect with the authorized scope, preserving engine order.
         products = if raw_ids.any?
@@ -264,28 +287,26 @@ module Spree
       # Database provider, which computes the same ones from the database.
       # As in #search_and_filter, only the Typesense requests are covered.
       def filters(scope:, query: nil, filters: {})
-        result, distribution, stats = begin
-          execute_faceted_search(query: query, filters: filters)
-        rescue Unavailable => e
-          report_unavailable(e.error, query)
-          return fallback_provider.filters(scope: scope, query: query, filters: filters)
-        end
+        fallback = -> { fallback_provider.filters(scope: scope, query: query, filters: filters) }
+        answer_through_breaker(query, fallback) do
+          result, distribution, stats = execute_faceted_search(query: query, filters: filters)
 
-        FiltersResult.new(
-          filters: Facets.build(distribution, currency: currency, stats: stats),
-          sort_options: sort_options_payload,
-          default_sort: default_sort_for(filters),
-          total_count: result['found'] || 0
-        )
+          FiltersResult.new(
+            filters: Facets.build(distribution, currency: currency, stats: stats),
+            sort_options: sort_options_payload,
+            default_sort: default_sort_for(filters),
+            total_count: result['found'] || 0
+          )
+        end
       end
 
       # Composite ids mean one product maps to N documents (locale × currency),
-      # so delete by filter on product_id rather than by document id.
+      # so delete by filter on product_id rather than by document id. From the
+      # live collection and any collection a reindex is filling.
       def remove_by_id(prefixed_id)
-        client.collections[collection_name]
-              .documents
-              .delete(filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)}")
-      rescue ::Typesense::Error::ObjectNotFound
+        each_write_target do |target, _live|
+          delete_product_documents(prefixed_id, from: target)
+        end
         nil
       end
 
@@ -304,55 +325,194 @@ module Spree
         @search_client ||= build_client(connection_timeout_seconds: search_timeout_seconds, num_retries: 0)
       end
 
+      # The live name searches and writes go through: since 0.3.0 an alias
+      # over the versioned collection the last reindex built (see
+      # IndexLayout).
       def collection_name
         @collection_name ||= "products_#{store.code}"
       end
 
       private
 
+      # Where this store's collections and aliases live.
+      def index_layout
+        @index_layout ||= IndexLayout.new(client, store.code)
+      end
+
+      def current_time_ms = Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond)
+
+      # The collection the live name serves from: a real collection holding
+      # the name, which takes requests ahead of an alias, else the alias's
+      # target. Nil when there is no index.
+      def live_collection_name
+        layout = index_layout
+        layout.legacy_collection? ? layout.live_name : layout.alias_target(layout.live_name)
+      end
+
+      # Yields each collection a single product's write goes to, and whether
+      # it is the live one. A collection being built that is gone is skipped:
+      # its reindex died, and the next one replaces it.
+      def each_write_target
+        index_layout.write_targets.each_with_index do |target, position|
+          live = position.zero?
+          begin
+            yield target, live
+          rescue ::Typesense::Error::ObjectNotFound
+            raise if live
+
+            Rails.logger.warn { "[spree_typesense] skipped '#{target}': the collection a reindex was building is gone" }
+          end
+        end
+      end
+
+      # Indexes the scope in batches into `into`.
+      # @return [Array(Integer, Array<Hash>)] documents accepted, and the rejected ones
+      def index_scope(scope, into:)
+        indexed = 0
+        failures = []
+        scope.reorder(id: :asc).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
+          read_at = current_time_ms
+          documents = batch.flat_map { |product| presenter_class.new(product, store).call }
+          next if documents.empty?
+
+          accepted = documents.size
+          begin
+            index_batch(documents, into: into, indexed_at: read_at)
+          rescue ImportError => e
+            failures.concat(e.failures)
+            accepted -= e.failures.size
+          end
+          indexed += accepted
+          Rails.logger.info { "[spree_typesense] indexed #{accepted} (#{indexed} total) into #{into}" }
+        end
+        [indexed, failures]
+      end
+
+      # Forgets a reindex's collection: removes the marker and drops it,
+      # leaving the live alias as it was. Best effort, so the error that
+      # stopped the reindex is the one raised.
+      def abandon_build(layout, building)
+        layout.unpoint!(layout.building_name)
+        layout.drop!(building)
+      rescue StandardError => e
+        Rails.logger.error { "[spree_typesense] could not clean up '#{building}': #{e.class}: #{e.message}" }
+      end
+
+      # Points the live alias at the collection just built, then drops what
+      # it replaced. Typesense refuses an alias whose name a collection holds,
+      # so a real collection holding the live name is dropped first; searches
+      # in that moment get a 404 and answer from the Database provider.
+      # Pointing the alias is retried once: after that drop, failing it would
+      # leave the store with no index. Once it points at the new collection
+      # the reindex has succeeded, so the clean-up after it only logs what it
+      # could not do. Older versioned collections go, newer ones stay: a newer
+      # one belongs to a reindex still running, which will drop this one when
+      # it swaps.
+      def swap_live_alias(layout, building)
+        previous = layout.alias_target(layout.live_name)
+        legacy = layout.legacy_collection?
+        layout.drop!(layout.live_name) if legacy
+        point_live_alias(layout, building)
+
+        after_swap("remove the #{layout.building_name} alias") { layout.unpoint!(layout.building_name) }
+        replaced = after_swap('list the collections it replaced') do
+          layout.versioned_collections.select { |name| name < building }
+        end || []
+        dropped = replaced.count { |name| after_swap("drop #{name}") { layout.drop!(name) } }
+
+        Rails.logger.info do
+          was = [(layout.live_name if legacy), previous].compact.uniq.join(', ')
+          "[spree_typesense] #{layout.live_name} now serves #{building}#{" (was #{was})" unless was.empty?}; " \
+            "dropped #{dropped} older collection(s)#{' and the real collection holding the live name' if legacy}"
+        end
+      end
+
+      def point_live_alias(layout, building)
+        attempts = 0
+        begin
+          layout.point!(layout.live_name, building)
+        rescue StandardError => e
+          attempts += 1
+          raise if attempts > 1
+
+          Rails.logger.warn { "[spree_typesense] pointing #{layout.live_name} at #{building} failed (#{e.message}); retrying" }
+          retry
+        end
+      end
+
+      # Clean-up once the live alias points at the new collection: the
+      # reindex has succeeded, so a failure here is logged for the next
+      # reindex to finish, not raised. Returns the block's value (truthy for
+      # a drop), or nil when it failed.
+      def after_swap(what)
+        yield || true
+      rescue StandardError => e
+        Rails.logger.warn do
+          "[spree_typesense] the swap succeeded, but could not #{what} (#{e.class}: #{e.message}); " \
+            'the next reindex will'
+        end
+        nil
+      end
+
       # The rejected documents of an import, logged one by one. A result names
       # its document only when the import asked for that, so fall back to the
       # position: Typesense answers one result per document, in order.
-      def import_failures(documents, results)
+      def import_failures(documents, results, into = collection_name)
         Array(results).each_with_index.filter_map do |result, index|
           next if result['success']
 
           failure = { id: result['id'] || documents.dig(index, 'id'), error: result['error'] }
           Rails.logger.error do
             "[spree_typesense] Typesense rejected document #{failure[:id]} in collection " \
-            "'#{collection_name}': #{failure[:error]}"
+            "'#{into}': #{failure[:error]}"
           end
           failure
         end
       end
 
-      # Deletes the product's documents other than `documents`; all of them
-      # when `documents` is empty. Ids go into the filter quoted in backticks,
-      # Typesense's string literal, because locales such as `en-US` put a
-      # hyphen in them. An id that itself holds a backtick cannot be quoted, so
-      # nothing is deleted then rather than risk deleting the wrong documents.
-      def remove_stale_documents(prefixed_id, documents)
+      # Deletes the product's documents in `from` other than `documents`; all
+      # of them when `documents` is empty. Only documents written before
+      # `written_before` go: a later job's are its own business. Ids go into
+      # the filter quoted in backticks, Typesense's string literal, because
+      # locales such as `en-US` put a hyphen in them. An id that itself holds a
+      # backtick cannot be quoted, so nothing is deleted then rather than risk
+      # deleting the wrong documents.
+      def remove_stale_documents(prefixed_id, documents, from:, written_before:)
         kept_ids = documents.map { |d| (d[:id] || d['id']).to_s }
-        return remove_by_id(prefixed_id) if kept_ids.empty?
+        return delete_product_documents(prefixed_id, from: from, written_before: written_before) if kept_ids.empty?
 
         if kept_ids.any? { |id| id.include?('`') }
           Rails.logger.warn { "[spree_typesense] not removing stale documents of #{prefixed_id}: an id holds a backtick" }
           return
         end
 
-        client.collections[collection_name].documents.delete(
+        client.collections[from].documents.delete(
           filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)} && " \
-                     "id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}]"
+                     "id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}] && indexed_at:<#{written_before.to_i}"
         )
       rescue ::Typesense::Error::ObjectNotFound
         nil
       end
 
-      # The Typesense request; callers wrap it in #request_typesense.
-      def execute_search(query:, conditions:, sort:, page:, limit:, facet_by: nil)
-        search_client.collections[collection_name].documents.search(
-          search_params(query: query, conditions: conditions, sort: sort, page: page, limit: limit, facet_by: facet_by)
-        )
+      # Nothing to remove from a collection that does not exist. With
+      # `written_before`, only documents stamped earlier.
+      def delete_product_documents(prefixed_id, from:, written_before: nil)
+        filter = "product_id:=#{sanitize_prefixed_id(prefixed_id)}"
+        filter += " && indexed_at:<#{written_before.to_i}" if written_before
+        client.collections[from].documents.delete(filter_by: filter)
+      rescue ::Typesense::Error::ObjectNotFound
+        nil
+      end
+
+      # The Typesense request; callers wrap it in #request_typesense. Sent as
+      # a one-search multi_search, a POST: a GET search carries its filter in
+      # the query string, which Typesense caps at 4000 characters, and a
+      # selection across option types can make a far longer filter.
+      def execute_search(query:, conditions:, sort:, page:, limit:, facet_by: nil, filters: {})
+        perform_searches(
+          [search_params(query: query, conditions: conditions, sort: sort, page: page, limit: limit,
+                         facet_by: facet_by, filters: filters)]
+        ).first
       end
 
       # Faceted read path. Returns [main_result, distribution, stats], and
@@ -380,11 +540,11 @@ module Spree
 
         option_type_ids = grouped.keys
         searches = [
-          search_params(query: query, conditions: base + QueryBuilder.grouped_option_conditions(grouped),
+          search_params(query: query, conditions: base + QueryBuilder.option_conditions(grouped).first,
                         sort: nil, page: 1, limit: 0, facet_by: facet_by)
         ]
         option_type_ids.each do |option_type_id|
-          relaxed = QueryBuilder.grouped_option_conditions(grouped.except(option_type_id))
+          relaxed = QueryBuilder.option_conditions(grouped.except(option_type_id)).first
           searches << search_params(query: query, conditions: base + relaxed,
                                     sort: nil, page: 1, limit: 0, facet_by: 'option_value_ids')
         end
@@ -395,20 +555,39 @@ module Spree
          Facets.normalize_stats(results.first['facet_counts'])]
       end
 
+      # The disjunctive facet searches, in one request.
+      def execute_multi_search(searches) = perform_searches(searches)
+
       # Typesense answers multi_search with HTTP 200 even when an individual
       # search failed — the failure is a per-result {error:, code:} body, NOT an
-      # exception. Diverges from the single-search path, so raise it here as
-      # one, or a broken filter would silently serve the wrong facet counts.
-      def execute_multi_search(searches)
+      # exception. Raise it here as the error a search would have raised for
+      # that status, so a broken filter cannot silently serve wrong results or
+      # counts, and a 5xx counts as transient.
+      def perform_searches(searches)
         response = search_client.multi_search.perform(
           { searches: searches.map { |s| s.merge(collection: collection_name) } }
         )
         results = response['results']
 
         failed = Array(results).find { |r| r['error'] }
-        raise SearchError, "multi_search failed: #{failed['code']} #{failed['error']}" if failed
+        raise search_error_for(failed) if failed
 
         results
+      end
+
+      PER_RESULT_ERRORS = {
+        400 => ::Typesense::Error::RequestMalformed,
+        401 => ::Typesense::Error::RequestUnauthorized,
+        403 => ::Typesense::Error::RequestUnauthorized,
+        404 => ::Typesense::Error::ObjectNotFound,
+        422 => ::Typesense::Error::ObjectUnprocessable
+      }.freeze
+      private_constant :PER_RESULT_ERRORS
+
+      def search_error_for(failed)
+        code = failed['code'].to_i
+        klass = PER_RESULT_ERRORS.fetch(code) { (500..599).cover?(code) ? ::Typesense::Error::ServerError : SearchError }
+        klass.new("multi_search failed: #{failed['code']} #{failed['error']}")
       end
 
       # Start from the main (fully filtered) distribution, then for each option
@@ -474,36 +653,20 @@ module Spree
         f.transform_keys(&:to_s)
       end
 
-      # The sort a listing starts on, as Spree 6's FiltersAggregator and
-      # Meilisearch provider derive it: the collection's own sort order, given
-      # in the API's form ('price desc' -> '-price'), and 'manual' otherwise.
-      # Only 6.x's filters endpoint passes `_collection`.
+      # The sort a listing starts on, as core's FiltersAggregator derives it:
+      # the collection's own sort order on Spree 6 (only 6.x passes
+      # `_collection`; its categories are manual only), the category's on
+      # Spree 5.x, given in the API's form ('price desc' -> '-price'), and
+      # 'manual' otherwise.
       def default_sort_for(filters)
-        collection = normalize_filters(filters)['_collection']
-        sort_order = collection.sort_order.presence if collection.respond_to?(:sort_order)
+        f = normalize_filters(filters)
+        grouping = f['_collection'] || (f['_category'] unless SpreeTypesense.spree_6?)
+        sort_order = grouping.sort_order.presence if grouping.respond_to?(:sort_order)
         field, direction = (sort_order || DEFAULT_SORT).to_s.split(' ', 2)
         direction == 'desc' ? "-#{field}" : field
       end
 
-      # Whether this is a single category or collection listing in the
-      # merchant's manual order, with no text query. Spree 6's Database
-      # provider orders those by position, the sort being 'manual' or omitted
-      # there (`manual_sort_grouping`); the index carries no positions, so
-      # #search_and_filter hands them to it. A text query keeps relevance, and
-      # several categories have no single position to follow.
-      #
-      # Spree 5's Database provider applies no position order through this
-      # API, so on 5.x a listing stays on Typesense.
-      def manual_sort_listing?(query:, filters:, sort:)
-        return false unless SpreeTypesense.spree_6?
-        return false if query.present?
-        return false unless sort.blank? || sort.to_s == 'manual'
-
-        f = normalize_filters(filters)
-        QueryBuilder.valid_id?(f['in_collection']) || QueryBuilder.valid_id?(f['in_category'])
-      end
-
-      def search_params(query:, conditions:, sort:, page:, limit:, facet_by: nil)
+      def search_params(query:, conditions:, sort:, page:, limit:, facet_by: nil, filters: {})
         params = {
           q: query.presence || '*',
           query_by: Schema::SEARCHABLE_FIELDS.join(','),
@@ -511,7 +674,8 @@ module Spree
           page: page,
           per_page: limit
         }
-        params[:sort_by] = QueryBuilder.sort_by(sort) if QueryBuilder.sort_by(sort)
+        sort_by = QueryBuilder.sort_by(sort, normalize_filters(filters))
+        params[:sort_by] = sort_by if sort_by
         if facet_by
           params[:facet_by] = facet_by
           # Typesense caps facet values at 10 per field by default and truncates
@@ -525,6 +689,53 @@ module Spree
         end
         params
       end
+
+      # Answers through Typesense unless the circuit breaker says it is
+      # failing, in which case `fallback` (the Database provider) answers at
+      # once, with nothing logged. A transient failure counts towards opening
+      # it, and the one that opens it is announced once; anything else
+      # Typesense answered, even with an error, counts as it answering.
+      # Missing configuration made no request and counts as neither. Errors
+      # that are not Typesense's propagate, and free the probe if this was it.
+      def answer_through_breaker(query, fallback)
+        breaker = circuit_breaker
+        return fallback.call unless breaker.allow_request?
+
+        begin
+          answer = yield
+        rescue Unavailable => e
+          record_unavailable(breaker, e.error)
+          report_unavailable(e.error, query)
+          return fallback.call
+        rescue StandardError
+          breaker.release_probe
+          raise
+        end
+
+        Rails.logger.info { '[spree_typesense] Typesense is answering again' } if breaker.record_success == :closed
+        answer
+      end
+
+      def record_unavailable(breaker, error)
+        if error.is_a?(::Typesense::Error::MissingConfiguration)
+          breaker.release_probe
+        elsif TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) }
+          announce_circuit_opened(breaker, error) if breaker.record_failure == :opened
+        elsif breaker.record_success == :closed
+          Rails.logger.info { '[spree_typesense] Typesense is answering again' }
+        end
+      end
+
+      def announce_circuit_opened(breaker, error)
+        message = "Typesense failed #{breaker.threshold} times in a row (last: #{error.class}: #{error.message}); " \
+                  "skipping it for #{breaker.open_seconds.to_s.delete_suffix('.0')} seconds and answering searches " \
+                  'from the Database provider'
+        Rails.logger.error { "[spree_typesense] #{message}" }
+        Rails.error.report(CircuitOpened.new(message), handled: true, severity: :warning,
+                                                      context: { collection: collection_name })
+      end
+
+      def circuit_breaker = SpreeTypesense::CircuitBreaker.for(ENV.fetch('TYPESENSE_URL', ''))
 
       # Runs a Typesense request, raising Unavailable in place of any failure
       # in UNAVAILABLE_ERRORS. Wrap only the request itself: whatever the block
@@ -540,9 +751,22 @@ module Spree
       # when it needs someone to act (see TRANSIENT_ERRORS). Missing
       # configuration is logged and reported once per process: it fails every
       # search the same way until someone sets it.
+      #
+      # A manual listing of a grouping no indexed document has a position in
+      # yet (before the first reindex that writes them, or a grouping with no
+      # indexed product) is refused by Typesense for want of the field. That
+      # is expected and needs nobody: it is logged at info, not reported, and
+      # the Database provider, which sorts by position too, answers it.
       def report_unavailable(error, query)
         if error.is_a?(::Typesense::Error::MissingConfiguration)
           return unless UNCONFIGURED_LOGGED.make_true
+        end
+        if unindexed_position_sort?(error)
+          Rails.logger.info do
+            "[spree_typesense] no indexed document has a position here yet (#{error.message}); answering this " \
+            'manual listing from the Database provider'
+          end
+          return
         end
 
         Rails.logger.error do
@@ -554,34 +778,41 @@ module Spree
                                   context: { collection: collection_name, query: query })
       end
 
+      def unindexed_position_sort?(error)
+        error.is_a?(::Typesense::Error::ObjectNotFound) && error.message.to_s.include?('field named `pos_')
+      end
+
       # Typesense alters a live collection in place: PATCH /collections/:name
       # with the fields to add. Documents already stored keep their values and
-      # gain the new fields when next indexed, which #reindex does straight
-      # after. So a field a release adds reaches an existing collection without
-      # dropping it, and a store keeps serving searches throughout.
+      # gain the new fields when next indexed. So a field a release adds
+      # reaches the collection without dropping it, and the store keeps
+      # serving searches throughout.
       #
       # What Typesense cannot do in place is change a field's type. Never drop
-      # the collection here, which would empty a live index: name the field and
-      # the remedy instead.
+      # the collection here, which would empty a live index: name the field
+      # and the remedy instead. A reindex builds a fresh collection, which has
+      # the declared type.
       #
-      # A failed PATCH raises, so a reindex stops rather than reporting success
+      # A failed PATCH raises, so the caller stops rather than carrying on
       # against a collection that still cannot serve the new filters.
-      def update_collection_schema!
-        live_fields = client.collections[collection_name].retrieve['fields']
+      #
+      # @param name [String] a real collection's name, not an alias
+      def update_collection_schema!(name)
+        live_fields = client.collections[name].retrieve['fields']
 
         missing = Schema.missing_fields(live_fields)
         if missing.any?
-          schema_client.collections[collection_name].update(fields: missing)
+          schema_client.collections[name].update(fields: missing)
           Rails.logger.info do
-            "[spree_typesense] added #{missing.map { |f| f[:name] }.join(', ')} to collection '#{collection_name}'"
+            "[spree_typesense] added #{missing.map { |f| f[:name] }.join(', ')} to collection '#{name}'"
           end
         end
 
         Schema.type_mismatches(live_fields).each do |mismatch|
           Rails.logger.warn do
-            "[spree_typesense] collection '#{collection_name}' declares '#{mismatch[:name]}' as " \
+            "[spree_typesense] collection '#{name}' declares '#{mismatch[:name]}' as " \
             "#{mismatch[:live_type]}, but this release declares it #{mismatch[:type]}. Typesense cannot change " \
-            "a field's type in place: drop the collection and reindex (`rake spree:search:reindex`)."
+            "a field's type in place: reindex (`rake spree:search:reindex`), which builds a fresh collection."
           end
         end
       end
@@ -632,8 +863,9 @@ module Spree
 
       # The presenter emits Spree's canonical document; Typesense needs fields
       # Spree does not provide. Derive them here rather than forking the presenter.
-      def derive_fields(document)
+      def derive_fields(document, indexed_at = nil)
         doc = document.transform_keys(&:to_s)
+        doc['indexed_at'] = indexed_at.to_i if indexed_at
         raw = doc['available_on']
         doc['available_on_i'] = raw.present? ? Time.parse(raw.to_s).to_i : 0
         doc

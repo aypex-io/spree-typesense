@@ -4,6 +4,13 @@ module Spree
       module QueryBuilder
         PREFIXED_ID_PATTERN = /\A[a-z]+_[A-Za-z0-9]+\z/
 
+        # Spree 6 documents carry one token per set of 2..6 option values one
+        # variant has (option_value_combination_ids). A selection across more
+        # types than that, or one making more tokens than the filter should
+        # carry, falls back to the per-type pre-filter narrowed by core.
+        MAX_COMBINATION_AXES = 6
+        MAX_COMBINATION_TOKENS = 1000
+
         SORT_MAP = {
           'price'         => 'price:asc',
           '-price'        => 'price:desc',
@@ -22,12 +29,15 @@ module Spree
         #
         # `channel_id` narrows to the products published on that channel, as
         # core's storefront scope does (`for_channel`). Documents carry raw
-        # channel ids as strings; the value is quoted so a UUID stays whole.
+        # store and channel ids as strings. String values go into the filter
+        # in backticks, Typesense's string literal, so a UUID or a hyphenated
+        # locale (`en-US`) stays one value; anything that could close the
+        # quote is stripped first.
         def system_conditions(store:, locale:, currency:, channel_id: nil, now: Time.current)
-          conditions = ["store_ids:=#{store.id.to_i}"]
+          conditions = ["store_ids:=`#{store.id.to_s.gsub(/[^a-zA-Z0-9_-]/, '')}`"]
           conditions << "channel_ids:=`#{channel_id.to_s.gsub(/[^a-zA-Z0-9_-]/, '')}`" if channel_id.present?
           conditions << "status:=active"
-          conditions << "locale:=#{locale.to_s.gsub(/[^a-zA-Z_-]/, '')}"
+          conditions << "locale:=`#{locale.to_s.gsub(/[^a-zA-Z_-]/, '')}`"
           conditions << "currency:=#{currency.to_s.upcase.gsub(/[^A-Z]/, '')}"
           # available_on_i, NOT available_on: Typesense silently matches zero
           # documents for range operators on string fields. A product
@@ -74,7 +84,47 @@ module Spree
             "collection_ids:=#{sanitize_id(value)}" if SpreeTypesense.spree_6? && valid_id?(value)
           when 'with_option_value_ids'
             nil # handled by grouped_option_conditions
+          # The records the filters endpoint passes on a category or (Spree 6)
+          # collection page, so facets and the total cover that grouping only.
+          when '_category'
+            grouping_condition('category_ids', value)
+          when '_collection'
+            grouping_condition('collection_ids', value) if SpreeTypesense.spree_6?
           end
+        end
+
+        def grouping_condition(field, record)
+          return unless record.respond_to?(:prefixed_id) && valid_id?(record.prefixed_id)
+
+          "#{field}:=#{sanitize_id(record.prefixed_id)}"
+        end
+
+        # The token a set of option values makes, the same whichever order
+        # they come in. The presenter writes these, the query asks for them.
+        def combination_token(prefixed_ids) = prefixed_ids.map(&:to_s).sort.join('|')
+
+        # The conditions a selection of option values (grouped by option type)
+        # adds, and whether they answer it exactly. Values of one type are a
+        # union, which the index answers. Values of several types must sit on
+        # one variant (core's `with_option_value_ids` on Spree 6): there the
+        # condition asks for any token over the cartesian product of the
+        # selected values. Otherwise, and on 5.x (which decides it on the
+        # product), the per-type conditions are only a pre-filter.
+        #
+        # @param grouped [Hash{Object => Array<String>}] prefixed ids by option type
+        # @return [Array(Array<String>, Boolean)] conditions, exact
+        def option_conditions(grouped)
+          axes = grouped.values.map { |ids| valid_ids(ids) }.reject(&:empty?)
+          return [[], true] if axes.empty?
+
+          per_type = grouped_option_conditions(grouped)
+          return [per_type, true] if axes.size == 1
+          return [per_type, false] unless SpreeTypesense.spree_6?
+          return [per_type, false] if axes.size > MAX_COMBINATION_AXES
+          return [per_type, false] if axes.map(&:size).reduce(:*) > MAX_COMBINATION_TOKENS
+
+          tokens = axes.first.product(*axes.drop(1)).map { |values| combination_token(values) }.uniq
+          [["option_value_combination_ids:=[#{tokens.map { |token| "`#{token}`" }.join(',')}]"], true]
         end
 
         # OR within an option type, AND across option types.
@@ -87,8 +137,26 @@ module Spree
           end
         end
 
-        def sort_by(sort_param)
+        # The Typesense sort for the API's sort param. On Spree 6, a listing of
+        # one collection or category in the merchant's order ('manual', or no
+        # sort there, whatever the text query, as core's Database provider
+        # decides) sorts by the product's position in it; the collection wins
+        # when both are given, as in core's `manual_sort_grouping`. 'manual'
+        # with no single grouping, and 5.x, keep the default ranking.
+        def sort_by(sort_param, filters = {})
+          if SpreeTypesense.spree_6? && (sort_param.blank? || sort_param.to_s == 'manual')
+            grouping = manual_grouping(filters)
+            return "pos_#{grouping}:asc" if grouping
+          end
+
           SORT_MAP[sort_param.to_s]
+        end
+
+        def manual_grouping(filters)
+          f = filters.respond_to?(:to_unsafe_h) ? filters.to_unsafe_h : (filters || {}).to_h
+          f = f.transform_keys(&:to_s)
+          id = [f['in_collection'], f['in_category']].find { |value| valid_id?(value) }
+          sanitize_id(id) if id
         end
 
         def valid_id?(value)  = PREFIXED_ID_PATTERN.match?(value.to_s)

@@ -56,9 +56,20 @@ module Spree
               # offered. Optional because 5.x documents never carry it.
               { name: 'collection_ids', type: 'string[]', facet: false, optional: true },
 
+              # Spree 6.x only: the product's position in each collection and
+              # category it belongs to, `pos_<prefixed id>` (an ancestor
+              # category takes the lowest position below it). A manual listing
+              # of one grouping sorts by its field. Declared by pattern, so
+              # each grouping's field appears as documents carry it.
+              { name: 'pos_.*', type: 'int32', facet: false, optional: true, sort: true },
+
               { name: 'option_type_ids',   type: 'string[]', facet: false, optional: true },
               { name: 'option_type_names', type: 'string[]', facet: false, optional: true },
               { name: 'option_value_ids',  type: 'string[]', facet: true,  optional: true },
+              # Spree 6.x only: one token per set of 2..6 option values one
+              # variant carries (`ov_a|ov_b`), so a filter on several option
+              # types matches a single variant, as core's scope does.
+              { name: 'option_value_combination_ids', type: 'string[]', facet: false, optional: true },
               { name: 'option_values',     type: 'string[]', facet: false, optional: true },
 
               { name: 'tags',             type: 'string[]', facet: true, optional: true },
@@ -76,6 +87,12 @@ module Spree
               # 0 means "always available", which also removes the need for upstream's
               # NOT EXISTS / IS NULL three-way clause.
               { name: 'available_on_i', type: 'int64', facet: false },
+
+              # DERIVED: when the index job read the product, in epoch ms.
+              # Stale-document removal deletes only documents stamped before
+              # its own read, so an older job finishing after a newer one
+              # cannot drop what the newer one wrote.
+              { name: 'indexed_at', type: 'int64', facet: false, optional: true },
 
               # Not emitted on spree_core 5.5.x, whose products have no
               # preorder?. Emitted on 5.6+ and 6.x (product.preorder?).

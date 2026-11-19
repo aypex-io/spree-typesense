@@ -13,8 +13,8 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters' do
   end
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch([
@@ -60,6 +60,24 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters' do
     )
   end
 
+  # A category page's filters endpoint passes the category; its facets and
+  # total cover that category only, not the whole store (#6).
+  it 'counts facets only within the category the filters endpoint passes' do
+    provider.index_batch([doc('prod_1', price: 10.0, in_stock: true).merge('category_ids' => %w[ctg_tea]),
+                          doc('prod_2', price: 50.0, in_stock: false).merge('category_ids' => %w[ctg_coffee]),
+                          doc('prod_3', price: 30.0, in_stock: true).merge('category_ids' => %w[ctg_tea])])
+    tea = Struct.new(:prefixed_id, :sort_order).new('ctg_tea', nil)
+    stub_ar_lookup(category_class, [FakeCatalog::Category.new(id: 'tea', prefixed_id: 'ctg_tea', names: 'Tea',
+                                                              permalink: 'tea')])
+
+    narrowed = provider.filters(scope: FakeScope.new(%w[prod_1 prod_2 prod_3]), filters: { '_category' => tea })
+
+    expect(narrowed.total_count).to eq(2)
+    expect(narrowed.filters.find { |f| f[:id] == 'availability' }[:options])
+      .to contain_exactly({ id: 'in_stock', count: 2 }, { id: 'out_of_stock', count: 0 })
+    expect(narrowed.filters.find { |f| f[:id] == 'price' }).to include(min: 10.0, max: 30.0)
+  end
+
   # The Database provider computes the same facets; fallback_spec.rb covers
   # each kind of failure.
   it 'answers from the Database provider when the engine errors' do
@@ -89,7 +107,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when the engine really errors'
   end
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
+    reset_typesense_index!(store.code)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     allow(Spree::SearchProvider::Database).to receive(:new).and_return(database)
@@ -119,8 +137,8 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters price range beyond th
   let(:highest)   { 122.5 }
 
   before do
-    provider.client.collections[provider.collection_name].delete rescue nil
-    provider.ensure_index_settings!
+    reset_typesense_index!(store.code)
+    bootstrap_index!(provider)
     allow(provider).to receive(:locale).and_return('en')
     allow(provider).to receive(:currency).and_return('USD')
     provider.index_batch(prices.each_with_index.map do |price, i|

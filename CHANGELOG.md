@@ -1,6 +1,116 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.3.0 (unreleased)
+
+- **CI tests Spree 6.0.5**, the latest release: the second Spree 6 leg moves
+  from 6.0.1 to 6.0.5.
+- **Fix: blank names for a store not written in the application's locale
+  (Spree 6).** Indexing runs in a job or a rake task, where Spree reads
+  translated base columns (name, description, slug, category and option
+  names) only in the application's default locale. A store whose default
+  market locale differs (`nl` beside an `en` application) was indexed with
+  blank names, so its products could not be found by name. The presenter now
+  reads in the store's locale, through `Spree::Current.with_content_locale` on
+  Spree 6.0.5+ and by setting `Spree::Current.content_locale` itself on 6.0.0
+  to 6.0.4, the same fix Spree 6.0.5 made to `spree_meilisearch`
+  (spree/spree#15226). A store without markets has its one fallback document
+  read in the locale it is labelled with.
+
+  Spree 5.6 reads base columns the same way, but on 5.x the documents stay
+  exactly as core's own 5.x presenter builds them, which this gem promises
+  there, so 5.x is left as it was.
+
+- **A full reindex swaps in a fresh collection** (#4). `rake
+  spree:search:reindex` builds `products_<code>_v<epoch ms>`, then points the
+  alias `products_<code>` at it and drops the collection it replaced, so
+  documents of deleted or out-of-scope products no longer linger in totals
+  and facets. Searches answer from the old collection until the swap; products
+  saved during the reindex are written to both. Rejected documents, or any
+  error, leave the store on the index it had. A field whose type changed now
+  needs only a reindex. Only a reindex creates the index.
+
+- **Fix: overlapping index jobs for one product no longer drop the newer
+  job's documents** (#9). Each document is stamped `indexed_at`, the moment
+  its job read the product, and a job deletes only stale documents stamped
+  before its own read. Spree 6.0.5 runs one search job per store at a time,
+  but only under Solid Queue; this holds on any queue adapter (Sidekiq
+  included).
+
+- **Fix: locale and store id are quoted in every search's filter** (#12).
+  A hyphenated locale (`en-US`) and a UUID store id now reach Typesense as
+  one backtick-quoted value, as channel ids already did.
+
+- **Facets on category and collection pages count only that grouping** (#6).
+  The filters endpoint passes the page's category (and, on Spree 6, its
+  collection); its facets and total now cover that grouping instead of the
+  whole store. Buyer-catalog narrowing is still not mirrored.
+- **Spree 5.x category pages default to the category's sort order** (#11), as
+  core 5.x's `FiltersAggregator` does, instead of `manual`.
+
+- **Spree 6 multi-option filters match one variant exactly** (#10).
+  Documents carry `option_value_combination_ids`, one token per set of two to
+  six option values a variant has (as `spree_meilisearch` 6.0.5 writes them),
+  and a filter on values of several option types asks for those tokens. Pages
+  are full and totals exact; core's `with_option_value_ids` narrowing now
+  applies only beyond six types or 1000 combinations, and on Spree 5.x.
+
+- **Category and collection listings in manual order are sorted by
+  Typesense** (#5). On Spree 6 documents carry `pos_<grouping prefixed id>`,
+  the product's position in each collection and category (an ancestor
+  category takes the lowest position below it, as core's `MIN(position)`
+  does), declared by the schema pattern `pos_.*`. A listing of one grouping
+  in manual order (`sort` omitted or `manual`, now with a text query too, as
+  core's Database provider decides) sorts by it instead of being handed to
+  the `Database` provider. A grouping no indexed document has a position in
+  yet still falls back, quietly.
+
+- **Searches skip Typesense for a while after it fails** (#8). After three
+  transient failures in a row (timeouts, 5xx, lost connections), a process
+  answers searches and facets from the `Database` provider at once for 30
+  seconds, logging and reporting the outage once
+  (`Spree::SearchProvider::Typesense::CircuitOpened`), then lets one search
+  probe Typesense. Set `TYPESENSE_BREAKER_THRESHOLD` and
+  `TYPESENSE_BREAKER_SECONDS` to change them. Errors that need someone to
+  act never open it. Indexing is unaffected.
+
+- **Published to RubyGems** (#7): `gem 'spree_typesense', '~> 0.3'`. MIT
+  licensed; released from `v*` tags by GitHub Actions through RubyGems
+  trusted publishing. Earlier releases are git tags only.
+
+- **Searches are sent as POST** (a one-search `multi_search`), so a long
+  filter (a selection across option types makes one token per combination)
+  is not refused by Typesense's 4000-character limit on a GET query string.
+  A failed search raises the error its status means (400, 401/403, 404, 422,
+  5xx), so a per-search 5xx counts as transient.
+- `reindex(scope)` makes the scope the whole index; to refresh some products,
+  index them one by one.
+
+### Upgrading
+
+Run `bin/rake spree:search:reindex` straight after deploying: every store
+must, for the new document fields and the alias layout.
+
+1. The first reindex builds `products_<code>_v<epoch ms>`, then drops 0.2.0's
+   real collection `products_<code>` and creates the alias of that name in
+   its place (Typesense refuses an alias named like a live collection).
+   Searches in that moment answer from the `Database` provider.
+2. Until it has run, on Spree 6, multi-option filters and manual listings are
+   answered by the `Database` provider (correct, more slowly).
+3. Rolling back to 0.2.0 works: its reindex recreates a real collection,
+   which Typesense serves ahead of the alias; searches return nothing until
+   it has filled it.
+
+See [Upgrading](README.md#upgrading) for the details.
+
+### Known limitations
+
+See [Known limitations](README.md#known-limitations): buyer-catalog
+narrowing is not mirrored in facets; manual sort adds a schema field per
+category and collection; filters across more than six option types fall back
+to core's narrowing; `price_between`, `cf_*` and other ransack filters and
+sorts are not served by the index.
+
+## 0.2.0 (2026-10-31)
 
 ### Spree 6.0 support
 
