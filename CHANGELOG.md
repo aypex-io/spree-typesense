@@ -77,6 +77,14 @@
   licensed; released from `v*` tags by GitHub Actions through RubyGems
   trusted publishing. Earlier releases are git tags only.
 
+- **Searches are sent as POST** (a one-search `multi_search`), so a long
+  filter (a selection across option types makes one token per combination)
+  is not refused by Typesense's 4000-character limit on a GET query string.
+  A failed search raises the error its status means (400, 401/403, 404, 422,
+  5xx), so a per-search 5xx counts as transient.
+- `reindex(scope)` makes the scope the whole index; to refresh some products,
+  index them one by one.
+
 ### Upgrading
 
 Run `bin/rake spree:search:reindex` straight after deploying: every store
