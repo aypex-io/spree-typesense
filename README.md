@@ -17,8 +17,11 @@ a multi-node cluster survives losing a node.
 ## Install
 
 ```ruby
-gem 'spree_typesense', github: 'aypex-io/spree_typesense', tag: 'v0.2.0'
+gem 'spree_typesense', '~> 0.3'
 ```
+
+Releases before 0.3.0 were published as git tags only
+(`gem 'spree_typesense', github: 'aypex-io/spree_typesense', tag: 'v0.2.0'`).
 
 Then select the provider by environment:
 

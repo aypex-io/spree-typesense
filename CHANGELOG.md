@@ -73,6 +73,10 @@
   `TYPESENSE_BREAKER_SECONDS` to change them. Errors that need someone to
   act never open it. Indexing is unaffected.
 
+- **Published to RubyGems** (#7): `gem 'spree_typesense', '~> 0.3'`. MIT
+  licensed; released from `v*` tags by GitHub Actions through RubyGems
+  trusted publishing. Earlier releases are git tags only.
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from
