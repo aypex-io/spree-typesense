@@ -47,6 +47,13 @@
 - **Spree 5.x category pages default to the category's sort order** (#11), as
   core 5.x's `FiltersAggregator` does, instead of `manual`.
 
+- **Spree 6 multi-option filters match one variant exactly** (#10).
+  Documents carry `option_value_combination_ids`, one token per set of two to
+  six option values a variant has (as `spree_meilisearch` 6.0.5 writes them),
+  and a filter on values of several option types asks for those tokens. Pages
+  are full and totals exact; core's `with_option_value_ids` narrowing now
+  applies only beyond six types or 1000 combinations, and on Spree 5.x.
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from

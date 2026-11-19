@@ -251,21 +251,22 @@ module Spree
         limit = limit.to_i.clamp(1, 100)
 
         base, grouped = build_conditions(filters)
+        option_conditions, exact = QueryBuilder.option_conditions(grouped)
         result = request_typesense do
-          execute_search(query: query, conditions: base + QueryBuilder.grouped_option_conditions(grouped),
-                         sort: sort, page: page, limit: limit)
+          execute_search(query: query, conditions: base + option_conditions, sort: sort, page: page, limit: limit)
         end
 
         product_ids = result['hits'].map { |h| h['document']['product_id'] }.uniq
         raw_ids = product_ids.filter_map { |pid| Spree::Product.decode_prefixed_id(pid) }
 
         # Values of two or more option types must sit on ONE variant, as core's
-        # `Product.with_option_value_ids` decides on Spree 6. The index holds a
-        # product's values as one set, so it only pre-filters; core's scope
-        # gives the exact answer, as in Spree's Meilisearch provider. (On 5.x
-        # core asks it of the product, as the index does, so this agrees.) A
-        # page can then come back short of `limit`, and the total over-counts.
-        scope = scope.with_option_value_ids(grouped.values.flatten) if grouped.size > 1
+        # `Product.with_option_value_ids` decides on Spree 6. Spree 6 documents
+        # carry combination tokens that answer it exactly. Where they cannot
+        # (more types than the tokens cover) and on 5.x (which asks it of the
+        # product, as the index does), the index only pre-filters and core's
+        # scope gives the exact answer, so a page can come back short of
+        # `limit` and the total over-count.
+        scope = scope.with_option_value_ids(grouped.values.flatten) unless exact
 
         # SECURITY: intersect with the authorized scope, preserving engine order.
         products = if raw_ids.any?
@@ -502,11 +503,11 @@ module Spree
 
         option_type_ids = grouped.keys
         searches = [
-          search_params(query: query, conditions: base + QueryBuilder.grouped_option_conditions(grouped),
+          search_params(query: query, conditions: base + QueryBuilder.option_conditions(grouped).first,
                         sort: nil, page: 1, limit: 0, facet_by: facet_by)
         ]
         option_type_ids.each do |option_type_id|
-          relaxed = QueryBuilder.grouped_option_conditions(grouped.except(option_type_id))
+          relaxed = QueryBuilder.option_conditions(grouped.except(option_type_id)).first
           searches << search_params(query: query, conditions: base + relaxed,
                                     sort: nil, page: 1, limit: 0, facet_by: 'option_value_ids')
         end

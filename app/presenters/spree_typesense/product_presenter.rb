@@ -21,8 +21,7 @@ module SpreeTypesense
   # plain-text description, plus `collection_ids` for the in_collection filter.
   # Those sources sit behind the private seams below.
   #
-  # Left out on purpose (later work): membership documents for manual sort,
-  # and `option_value_combination_ids`.
+  # Left out on purpose (later work): membership documents for manual sort.
   class ProductPresenter
     attr_reader :product, :store
 
@@ -134,7 +133,12 @@ module SpreeTypesense
       document.merge!(
         option_type_ids: product.option_types.map(&:prefixed_id),
         option_type_names: product.option_types.map { |ot| translated(ot, label_attribute, fallback_locale) },
-        option_value_ids: variant_option_value_ids,
+        option_value_ids: variant_option_value_ids
+      )
+      # 6.x only, where several option types must match one variant; placed
+      # as in spree_meilisearch 6.0's document.
+      document[:option_value_combination_ids] = variant_option_value_combination_ids if SpreeTypesense.spree_6?
+      document.merge!(
         option_values: variant_option_values_data.map { |ov| translated(ov, label_attribute, fallback_locale) }.uniq,
         tags: product.tag_list || [],
         units_sold_count: product.units_sold_count || 0,
@@ -260,6 +264,22 @@ module SpreeTypesense
 
     def variant_option_values_data
       @variant_option_values_data ||= option_value_variants.flat_map(&:option_values).uniq
+    end
+
+    # One token per set of two or more option values that sit on the SAME
+    # variant, as spree_meilisearch 6.0.5 writes them. `option_value_ids` is a
+    # union across variants, so it cannot tell a product selling a blue XL
+    # from one selling a blue S beside a red XL; a token per whole set can.
+    # Sets reach MAX_COMBINATION_AXES values: the count grows exponentially,
+    # and a filter across more types falls back to core's narrowing.
+    def variant_option_value_combination_ids
+      max_axes = Spree::SearchProvider::Typesense::QueryBuilder::MAX_COMBINATION_AXES
+      product.variants.flat_map do |variant|
+        ids = variant.option_values.map(&:prefixed_id)
+        (2..[ids.size, max_axes].min).flat_map do |size|
+          ids.combination(size).map { |set| Spree::SearchProvider::Typesense::QueryBuilder.combination_token(set) }
+        end
+      end.uniq
     end
   end
 end

@@ -4,6 +4,13 @@ module Spree
       module QueryBuilder
         PREFIXED_ID_PATTERN = /\A[a-z]+_[A-Za-z0-9]+\z/
 
+        # Spree 6 documents carry one token per set of 2..6 option values one
+        # variant has (option_value_combination_ids). A selection across more
+        # types than that, or one making more tokens than the filter should
+        # carry, falls back to the per-type pre-filter narrowed by core.
+        MAX_COMBINATION_AXES = 6
+        MAX_COMBINATION_TOKENS = 1000
+
         SORT_MAP = {
           'price'         => 'price:asc',
           '-price'        => 'price:desc',
@@ -90,6 +97,34 @@ module Spree
           return unless record.respond_to?(:prefixed_id) && valid_id?(record.prefixed_id)
 
           "#{field}:=#{sanitize_id(record.prefixed_id)}"
+        end
+
+        # The token a set of option values makes, the same whichever order
+        # they come in. The presenter writes these, the query asks for them.
+        def combination_token(prefixed_ids) = prefixed_ids.map(&:to_s).sort.join('|')
+
+        # The conditions a selection of option values (grouped by option type)
+        # adds, and whether they answer it exactly. Values of one type are a
+        # union, which the index answers. Values of several types must sit on
+        # one variant (core's `with_option_value_ids` on Spree 6): there the
+        # condition asks for any token over the cartesian product of the
+        # selected values. Otherwise, and on 5.x (which decides it on the
+        # product), the per-type conditions are only a pre-filter.
+        #
+        # @param grouped [Hash{Object => Array<String>}] prefixed ids by option type
+        # @return [Array(Array<String>, Boolean)] conditions, exact
+        def option_conditions(grouped)
+          axes = grouped.values.map { |ids| valid_ids(ids) }.reject(&:empty?)
+          return [[], true] if axes.empty?
+
+          per_type = grouped_option_conditions(grouped)
+          return [per_type, true] if axes.size == 1
+          return [per_type, false] unless SpreeTypesense.spree_6?
+          return [per_type, false] if axes.size > MAX_COMBINATION_AXES
+          return [per_type, false] if axes.map(&:size).reduce(:*) > MAX_COMBINATION_TOKENS
+
+          tokens = axes.first.product(*axes.drop(1)).map { |values| combination_token(values) }.uniq
+          [["option_value_combination_ids:=[#{tokens.map { |token| "`#{token}`" }.join(',')}]"], true]
         end
 
         # OR within an option type, AND across option types.

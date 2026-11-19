@@ -99,10 +99,12 @@ and with it the documents of products that were deleted or left the scope.
   `-price`, `name`, `-name`, `available_on`, `-available_on` and
   `best_selling`; any other sort, such as `created_at` or a `cf_*` sort, gets
   the default ranking. `cf_*` sorts are not offered.
-- **Values of two or more option types** must sit on one variant on Spree 6.
-  The index pre-filters by each type, and the product scope is narrowed through
-  core's `Product.with_option_value_ids`, so a page can come back shorter than
-  `limit` and the total can over-count.
+- **Values of more than six option types at once.** On Spree 6, values of
+  two to six option types must sit on one variant, and the index answers that
+  exactly through one token per set of a variant's values. Beyond six types
+  (or 1000 combinations of the selected values) the index only pre-filters by
+  each type and core's `Product.with_option_value_ids` narrows the scope, so a
+  page can come back shorter than `limit` and the total can over-count.
 
 ## Engine behaviours this gem depends on
 

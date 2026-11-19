@@ -59,6 +59,10 @@ module Spree
               { name: 'option_type_ids',   type: 'string[]', facet: false, optional: true },
               { name: 'option_type_names', type: 'string[]', facet: false, optional: true },
               { name: 'option_value_ids',  type: 'string[]', facet: true,  optional: true },
+              # Spree 6.x only: one token per set of 2..6 option values one
+              # variant carries (`ov_a|ov_b`), so a filter on several option
+              # types matches a single variant, as core's scope does.
+              { name: 'option_value_combination_ids', type: 'string[]', facet: false, optional: true },
               { name: 'option_values',     type: 'string[]', facet: false, optional: true },
 
               { name: 'tags',             type: 'string[]', facet: true, optional: true },
