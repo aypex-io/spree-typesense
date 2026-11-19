@@ -380,6 +380,7 @@ module Spree
         scope.unscope(:order).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
           read_at = current_time_ms
           documents = batch.flat_map { |product| presenter_class.new(product, store).call }
+          documents = without_newer_writes(documents, into: into, read_at: read_at)
           next if documents.empty?
 
           accepted = documents.size
@@ -394,6 +395,43 @@ module Spree
         end
         [indexed, failures]
       end
+
+      # The batch's documents, less those of products a single-product write
+      # (#index) has put into `into` since the batch was read (#23). That
+      # write read the product later, so its documents are the newer ones:
+      # importing the batch's over them would take the older ones live. A
+      # write landing between this lookup and the import can still be
+      # overwritten, but that window is one request, where the batch's is
+      # the time it takes to build its documents.
+      def without_newer_writes(documents, into:, read_at:)
+        return documents if documents.empty?
+
+        newer = product_ids_written_since(documents.map { |d| document_product_id(d) }.uniq, into: into, since: read_at)
+        return documents if newer.empty?
+
+        Rails.logger.info do
+          "[spree_typesense] left out #{newer.sort.join(', ')}: saved since this batch was read, so #{into} holds newer documents"
+        end
+        documents.reject { |d| newer.include?(document_product_id(d)) }
+      end
+
+      # Which of the products have a document in `into` stamped `since` or
+      # later: one facet search, sent as a POST, as a batch's ids are longer
+      # than Typesense's GET limit allows.
+      def product_ids_written_since(product_ids, into:, since:)
+        quoted = product_ids.map { |id| "`#{id}`" }.join(',')
+        response = client.multi_search.perform(
+          { searches: [{ collection: into, q: '*', per_page: 0,
+                         filter_by: "product_id:=[#{quoted}] && indexed_at:>=#{since.to_i}",
+                         facet_by: 'product_id', max_facet_values: product_ids.size }] }
+        )
+        result = Array(response['results']).first || {}
+        raise search_error_for(result) if result['error']
+
+        (Facets.normalize(result['facet_counts'])['product_id'] || {}).keys
+      end
+
+      def document_product_id(document) = sanitize_prefixed_id(document[:product_id] || document['product_id'])
 
       # Forgets a reindex's collection: removes the marker while it is still
       # this reindex's, and drops the collection, leaving the live alias as
