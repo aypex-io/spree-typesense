@@ -11,13 +11,28 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
       )
     end
 
+    # Documents carry store ids as strings; quoted, so a UUID stays whole
+    # and `7` cannot match as part of anything else.
     it 'scopes to the store' do
-      expect(conds).to include("store_ids:=7")
+      expect(conds).to include('store_ids:=`7`')
+    end
+
+    it 'quotes a UUID store id whole' do
+      uuid_store = instance_double('Spree::Store', id: '0b6c3c1e-8f3a-4c1e-9d2a-1f0e2d3c4b5a')
+      out = described_class.system_conditions(store: uuid_store, locale: 'en', currency: 'USD')
+
+      expect(out).to include('store_ids:=`0b6c3c1e-8f3a-4c1e-9d2a-1f0e2d3c4b5a`')
     end
 
     # THE multi-market test. Without these two, every market's copy matches.
     it 'scopes to the requested locale and currency' do
-      expect(conds).to include('locale:=en', 'currency:=USD')
+      expect(conds).to include('locale:=`en`', 'currency:=USD')
+    end
+
+    it 'quotes a hyphenated locale whole' do
+      out = described_class.system_conditions(store: store, locale: 'en-US', currency: 'USD')
+
+      expect(out).to include('locale:=`en-US`')
     end
 
     it 'restricts to active products' do
@@ -54,6 +69,14 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
       locale_and_currency = out.select { |c| c.start_with?('locale:', 'currency:') }.join(' ')
       expect(locale_and_currency).not_to include("'")
       expect(locale_and_currency).not_to include('||')
+    end
+
+    it 'strips anything that could close the quote around the locale or store id' do
+      hostile_store = instance_double('Spree::Store', id: '7` || store_ids:=`8')
+      out = described_class.system_conditions(store: hostile_store, locale: 'en` || locale:=`de', currency: 'USD')
+
+      expect(out.grep(/\Alocale:/).sole).to eq('locale:=`enlocalede`')
+      expect(out.grep(/\Astore_ids:/).sole).to eq('store_ids:=`7store_ids8`')
     end
 
     it 'upcases lowercase currency codes rather than dropping them' do

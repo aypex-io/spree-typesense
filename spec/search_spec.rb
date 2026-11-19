@@ -36,6 +36,16 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
     expect(result.products.map(&:prefixed_id)).to eq(%w[prod_1])
   end
 
+  # Locales such as en-US carry a hyphen, which the locale filter must quote.
+  it 'finds documents in a hyphenated locale' do
+    provider.index_batch([doc('prod_4', name: 'Herbal Tea', locale: 'en-US')])
+    allow(provider).to receive(:locale).and_return('en-US')
+
+    result = provider.search_and_filter(scope: FakeScope.new(%w[prod_1 prod_4]), query: 'herbal')
+
+    expect(result.products.map(&:prefixed_id)).to eq(%w[prod_4])
+  end
+
   # THE security test.
   it 'never returns a product missing from the authorized scope' do
     result = provider.search_and_filter(scope: FakeScope.new(%w[prod_2]), query: 'herbal')
