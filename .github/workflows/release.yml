@@ -46,4 +46,37 @@ jobs:
           ruby-version: '4.0'
           bundler-cache: true
 
+      # RubyGems.org asks the first push from a pending trusted publisher to
+      # name the account that will own the new gem (`owner`, the account's
+      # immutable id, shown on its pending trusted publisher), and rejects a
+      # push that does not. rubygems/release-gem (v1.4.2) and the
+      # configure-rubygems-credentials action it uses (v2.1.0) take no such
+      # input, so exchange the GitHub OIDC token here, as that action would,
+      # adding the owner. Later pushes may pass it too.
+      - name: Exchange the GitHub OIDC token for a RubyGems API key
+        env:
+          RUBYGEMS_OWNER: '142484'
+        run: |
+          jwt=$(curl --fail-with-body -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rubygems.org" | jq -r .value)
+          response=$(curl --fail-with-body -sS -X POST \
+            https://rubygems.org/api/v1/oidc/trusted_publisher/exchange_token \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg jwt "$jwt" --arg owner "$RUBYGEMS_OWNER" '{jwt: $jwt, owner: $owner}')") || {
+            echo "Exchange refused: $response" >&2
+            exit 1
+          }
+          key=$(jq -r '.rubygems_api_key // empty' <<<"$response")
+          if [ -z "$key" ]; then
+            echo "No API key in the exchange response: $(jq -c 'del(.rubygems_api_key)' <<<"$response")" >&2
+            exit 1
+          fi
+          echo "::add-mask::$key"
+          echo "GEM_HOST_API_KEY=$key" >> "$GITHUB_ENV"
+          echo "RubyGems key for $(jq -r '.name' <<<"$response"), owner $(jq -r '.owner // "-"' <<<"$response")"
+
+      # Credentials come from the step above, so the action must not set up
+      # its own (which would exchange without the owner).
       - uses: rubygems/release-gem@v1
+        with:
+          setup-trusted-publisher: false
