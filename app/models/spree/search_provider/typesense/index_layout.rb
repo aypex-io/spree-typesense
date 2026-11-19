@@ -71,6 +71,20 @@ module Spree
           nil
         end
 
+        # Removes the alias only while it points at the collection: a newer
+        # reindex may have taken the `__building` marker since (#22).
+        # Typesense has no compare-and-delete, so this reads, then deletes;
+        # a newer reindex taking the marker between the two loses it.
+        # @param alias_name [String]
+        # @param collection_name [String]
+        # @return [Boolean] whether the alias was removed
+        def release!(alias_name, collection_name)
+          return false unless alias_target(alias_name) == collection_name
+
+          unpoint!(alias_name)
+          true
+        end
+
         # Drops the collection; one already gone is fine.
         # @param collection_name [String]
         def drop!(collection_name)

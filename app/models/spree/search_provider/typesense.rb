@@ -135,6 +135,12 @@ module Spree
       # names them all, so `rake spree:search:reindex` fails visibly; the new
       # collection is then dropped and the live alias left where it was, so
       # no product goes missing from search. Any other error does the same.
+      #
+      # Reindexes can overlap (a manual rake run during the deploy hook's).
+      # The one that started last holds the marker, so only it receives
+      # single-product writes from then on, and only it goes live: an older
+      # one that finds the marker taken when it ends, or fails, drops its
+      # collection and returns 0, leaving the newer one to swap in (#22).
       def reindex(scope = nil)
         scope ||= store.products
         layout = index_layout
@@ -144,10 +150,13 @@ module Spree
 
         begin
           indexed, failures = index_scope(scope, into: building)
-        rescue StandardError
+        rescue StandardError => e
+          return give_way(layout, building, e) if superseded?(layout, building)
+
           abandon_build(layout, building)
           raise
         end
+        return give_way(layout, building) if superseded?(layout, building)
 
         Rails.logger.info do
           "[spree_typesense] reindex complete: #{indexed} documents indexed, #{failures.size} failed"
@@ -386,14 +395,44 @@ module Spree
         [indexed, failures]
       end
 
-      # Forgets a reindex's collection: removes the marker and drops it,
-      # leaving the live alias as it was. Best effort, so the error that
-      # stopped the reindex is the one raised.
+      # Forgets a reindex's collection: removes the marker while it is still
+      # this reindex's, and drops the collection, leaving the live alias as
+      # it was. Best effort, so the error that stopped the reindex is the one
+      # raised.
       def abandon_build(layout, building)
-        layout.unpoint!(layout.building_name)
+        layout.release!(layout.building_name, building)
         layout.drop!(building)
       rescue StandardError => e
         Rails.logger.error { "[spree_typesense] could not clean up '#{building}': #{e.class}: #{e.message}" }
+      end
+
+      # Whether a newer reindex has taken the marker from this one: it points
+      # at another collection, or is gone because that reindex has finished.
+      # When the marker cannot be read, the reindex goes on as its own.
+      def superseded?(layout, building)
+        layout.alias_target(layout.building_name) != building
+      rescue StandardError
+        false
+      end
+
+      # A newer reindex took the marker while this one was filling
+      # `building`, so `building` has missed the single-product writes made
+      # since, and the newer one will swap in a collection that has them.
+      # Drops `building`, leaves the live alias and the marker alone, and
+      # reports nothing indexed. A failure of this reindex is logged: the
+      # newer one meets it too, if it is not passing.
+      def give_way(layout, building, error = nil)
+        Rails.logger.warn do
+          "[spree_typesense] a newer reindex took over while this one was building #{building}" \
+            "#{" (and this one failed: #{error.class}: #{error.message})" if error}; " \
+            "dropping #{building} and leaving #{layout.live_name} to the newer reindex"
+        end
+        begin
+          layout.drop!(building)
+        rescue StandardError => e
+          Rails.logger.warn { "[spree_typesense] could not drop '#{building}' (#{e.class}: #{e.message}); the next reindex will" }
+        end
+        0
       end
 
       # Points the live alias at the collection just built, then drops what
@@ -412,7 +451,7 @@ module Spree
         layout.drop!(layout.live_name) if legacy
         point_live_alias(layout, building)
 
-        after_swap("remove the #{layout.building_name} alias") { layout.unpoint!(layout.building_name) }
+        after_swap("remove the #{layout.building_name} alias") { layout.release!(layout.building_name, building) }
         replaced = after_swap('list the collections it replaced') do
           layout.versioned_collections.select { |name| name < building }
         end || []
