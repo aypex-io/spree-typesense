@@ -67,6 +67,8 @@ RSpec.describe Spree::SearchProvider::Typesense, '#filters' do
                           doc('prod_2', price: 50.0, in_stock: false).merge('category_ids' => %w[ctg_coffee]),
                           doc('prod_3', price: 30.0, in_stock: true).merge('category_ids' => %w[ctg_tea])])
     tea = Struct.new(:prefixed_id, :sort_order).new('ctg_tea', nil)
+    stub_ar_lookup(category_class, [FakeCatalog::Category.new(id: 'tea', prefixed_id: 'ctg_tea', names: 'Tea',
+                                                              permalink: 'tea')])
 
     narrowed = provider.filters(scope: FakeScope.new(%w[prod_1 prod_2 prod_3]), filters: { '_category' => tea })
 
