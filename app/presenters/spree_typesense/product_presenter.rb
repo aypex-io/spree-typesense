@@ -34,6 +34,14 @@ module SpreeTypesense
     # Returns an array of documents — one per market × locale combination.
     # Each document has flat name, description, price fields (no dynamic suffixes).
     def call
+      # Indexing runs in a job or a rake task, where nothing has named the
+      # locale the base columns are written in.
+      with_store_content_locale { build_documents }
+    end
+
+    private
+
+    def build_documents
       documents = []
 
       market_locale_pairs.each do |market, locale|
@@ -48,15 +56,45 @@ module SpreeTypesense
       # Fallback for stores without markets (legacy/test)
       if documents.empty?
         fallback_currency = store.default_market&.currency || store.supported_currencies_list.first&.iso_code
-        if fallback_currency && lowest_price(fallback_currency)
-          documents << build_document(default_locale, fallback_currency, default_locale)
-        end
+        documents << fallback_document(fallback_currency) if fallback_currency && lowest_price(fallback_currency)
       end
 
       documents
     end
 
-    private
+    # Spree 6 reads a translated attribute from its base column only in
+    # `Spree::Current.content_locale`, the locale the store's content is
+    # written in. A request sets that to the store's locale; a job or a rake
+    # task leaves it at the application's default. So for a store whose
+    # default market locale is not the application's (`nl` beside `en`), every
+    # name, description and slug read here came out blank, and the product
+    # could not be found by name. Spree 6.0.5 fixed its own presenter
+    # (spree/spree#15226) by naming the store's locale with
+    # `Spree::Current.with_content_locale`; this does the same, and on 6.0.0
+    # to 6.0.4, which lack that helper, sets and restores the attribute itself.
+    #
+    # On 5.x the documents stay as core's presenter builds them.
+    def with_store_content_locale(&block)
+      return yield unless SpreeTypesense.spree_6?
+      return Spree::Current.with_content_locale(default_locale, &block) if Spree::Current.respond_to?(:with_content_locale)
+
+      previous = Spree::Current.attributes[:content_locale]
+      Spree::Current.content_locale = default_locale.to_s
+      begin
+        yield
+      ensure
+        Spree::Current.content_locale = previous
+      end
+    end
+
+    # On 6.x the document is read in the locale it is labelled with, as in
+    # Spree 6.0.5's presenter, rather than in whatever locale the job runs in.
+    # On 5.x it is read as core's presenter reads it.
+    def fallback_document(currency)
+      return build_document(default_locale, currency, default_locale) unless SpreeTypesense.spree_6?
+
+      Mobility.with_locale(default_locale) { build_document(default_locale, currency, default_locale) }
+    end
 
     # Key order follows core's 5.6.1 presenter, so documents compare equal
     # field by field and serialise identically.

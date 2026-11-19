@@ -10,7 +10,8 @@ gemspec
 # CI sets SPREE_CORE_VERSION per matrix leg: 5.5.1 (the oldest supported
 # release), the latest 5.6.x (which emits a `preorder` field 5.5 does not —
 # the reason the schema declares that field optional — and `cf_*` metafield
-# keys), and 6.0.0 and 6.0.1 (no core presenter, categories, custom fields).
+# keys), and 6.0.0 and the latest 6.0.x (no core presenter, categories, custom
+# fields; 6.0.5 added `Spree::Current.with_content_locale`).
 if (spree_core_version = ENV['SPREE_CORE_VERSION'])
   gem 'spree_core', spree_core_version
 end

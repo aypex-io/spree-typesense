@@ -150,6 +150,12 @@ emits the same fields as on 5.6:
   `spree_meilisearch` 6.0 does, so tag names are not searchable.
 - **`variants_including_master` is deprecated.** Option values come from
   `product.variants`.
+- **Base columns are read in the store's content locale.** Spree 6 reads a
+  translated attribute's base column only in `Spree::Current.content_locale`,
+  which a job or rake task leaves at the application's default locale. The
+  presenter sets it to the store's default market locale while it builds, as
+  `spree_meilisearch` does from 6.0.5. Without this, a store whose locale is
+  not the application's (`nl` beside `en`) would index blank names.
 - **Providers take an `audience:`** (`:store` by default, `nil` for the back
   office). The gem inherits `Base#initialize`, so `custom_field_schema` is
   limited to what that audience may see. When Typesense cannot answer, the

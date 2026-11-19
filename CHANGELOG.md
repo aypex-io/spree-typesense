@@ -1,6 +1,33 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.3.0 (unreleased)
+
+- **CI tests Spree 6.0.5**, the latest release: the second Spree 6 leg moves
+  from 6.0.1 to 6.0.5.
+- **Fix: blank names for a store not written in the application's locale
+  (Spree 6).** Indexing runs in a job or a rake task, where Spree reads
+  translated base columns (name, description, slug, category and option
+  names) only in the application's default locale. A store whose default
+  market locale differs (`nl` beside an `en` application) was indexed with
+  blank names, so its products could not be found by name. The presenter now
+  reads in the store's locale, through `Spree::Current.with_content_locale` on
+  Spree 6.0.5+ and by setting `Spree::Current.content_locale` itself on 6.0.0
+  to 6.0.4, the same fix Spree 6.0.5 made to `spree_meilisearch`
+  (spree/spree#15226). A store without markets has its one fallback document
+  read in the locale it is labelled with.
+
+  Spree 5.6 reads base columns the same way, but on 5.x the documents stay
+  exactly as core's own 5.x presenter builds them, which this gem promises
+  there, so 5.x is left as it was.
+
+### Upgrading
+
+On Spree 6, a store whose default market locale differs from
+`config.i18n.default_locale`: bump the gem and run
+`bin/rake spree:search:reindex` to fill in the names. Other stores need do
+nothing.
+
+## 0.2.0 (2026-10-31)
 
 ### Spree 6.0 support
 

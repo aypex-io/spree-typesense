@@ -218,6 +218,59 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       expect(product).not_to have_received(:variants_including_master)
       expect(product).not_to have_received(:metafields)
     end
+
+    # Outside a request Spree reads a translated attribute's base column only
+    # in the application's default locale, so a store written in another
+    # locale was indexed with blank names (fixed in core's own presenter in
+    # Spree 6.0.5). These fakes do not model Mobility's column fallback, so
+    # the examples check that the presenter names the store's locale while it
+    # reads, not that a real record's names then come out.
+    context "when the store's locale is not the application's" do
+      let(:nl) { FakeCatalog::Market.new(currency: 'EUR', supported_locales_list: %w[nl en], default_locale: 'nl') }
+      let(:dutch_store) do
+        FakeCatalog::Store.new(id: 7, code: 'dutch', markets: [nl], default_market: nl,
+                               supported_currencies_list: [FakeCatalog::Currency.new('EUR')])
+      end
+      let(:bicycle) do
+        FakeCatalog::Product.new(prefixed_id: 'prod_bike', names: { 'nl' => 'Fiets', 'en' => 'Bicycle' },
+                                 prices: { 'EUR' => BigDecimal('300') })
+      end
+
+      it "reads the product in the store's content locale, and restores the content locale after" do
+        content_locales = []
+        allow(bicycle).to receive(:name).and_wrap_original do |original, **kwargs|
+          content_locales << Spree::Current.content_locale
+          original.call(**kwargs)
+        end
+        before = Spree::Current.attributes[:content_locale]
+
+        described_class.new(bicycle, dutch_store).call
+
+        expect(content_locales.uniq).to eq(['nl'])
+        expect(Spree::Current.attributes[:content_locale]).to eq(before)
+      end
+
+      it 'restores the content locale when a document fails to build' do
+        allow(bicycle).to receive(:name).and_raise(RuntimeError, 'boom')
+        before = Spree::Current.attributes[:content_locale]
+
+        expect { described_class.new(bicycle, dutch_store).call }.to raise_error(RuntimeError, 'boom')
+        expect(Spree::Current.attributes[:content_locale]).to eq(before)
+      end
+
+      context 'and no market to build documents for' do
+        let(:no_markets) do
+          FakeCatalog::Store.new(id: 7, code: 'dutch', markets: [], default_market: nl,
+                                 supported_currencies_list: [FakeCatalog::Currency.new('EUR')])
+        end
+
+        it "indexes one document in the store's locale, read in that locale" do
+          documents = described_class.new(bicycle, no_markets).call
+
+          expect(documents.map { |d| d.values_at(:locale, :name) }).to eq([%w[nl Fiets]])
+        end
+      end
+    end
   end
 
   # Whichever version is under test, its documents must import cleanly into
