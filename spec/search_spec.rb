@@ -201,8 +201,9 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
   context 'filtering by collection on Spree 6.x', if: SpreeTypesense.spree_6? do
     before do
       provider.index_batch([
-        doc('prod_4', name: 'Herbal Tea', price: 20.0).merge('collection_ids' => %w[coll_summer]),
-        doc('prod_5', name: 'Herbal Gummies', price: 30.0).merge('collection_ids' => %w[coll_summer coll_new])
+        doc('prod_4', name: 'Herbal Tea', price: 20.0).merge('collection_ids' => %w[coll_summer], 'pos_coll_summer' => 2),
+        doc('prod_5', name: 'Herbal Gummies', price: 30.0)
+          .merge('collection_ids' => %w[coll_summer coll_new], 'pos_coll_summer' => 1, 'pos_coll_new' => 1)
       ])
     end
 
