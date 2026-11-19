@@ -2,7 +2,7 @@ require 'spec_helper'
 
 RSpec.describe SpreeTypesense do
   it 'has a version' do
-    expect(SpreeTypesense::VERSION).to match(/\A\d+\.\d+\.\d+\z/)
+    expect(SpreeTypesense::VERSION).to match(/\A\d+\.\d+\.\d+(\.(alpha|beta|rc)\d+)?\z/)
   end
 
   it 'can reach the Typesense server' do
