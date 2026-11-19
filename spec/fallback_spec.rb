@@ -303,6 +303,20 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
       expect(breaker.state).to eq(:closed)
     end
 
+    it 'recovers when the probe is killed by an exception outside StandardError' do
+      killed = Class.new(Exception) # rubocop:disable Lint/InheritException
+      3.times { search }
+      now[0] += 30
+      allow(provider).to receive(:search_client).and_return(RecordingTypesenseClient.new { raise killed })
+      expect { search }.to raise_error(killed)
+
+      now[0] += 30
+      allow(provider).to receive(:search_client).and_return(RecordingTypesenseClient.new)
+      search
+
+      expect(breaker.state).to eq(:closed)
+    end
+
     it 'lets the next request probe when the probe raised an error that is not Typesense failing' do
       3.times { search }
       now[0] += 30

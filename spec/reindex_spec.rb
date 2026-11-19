@@ -134,6 +134,37 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
     expect(live_ids).to eq(['prod_1_en_USD'])
   end
 
+  # On the 0.2.0 layout the real collection is dropped before the alias can
+  # take its name; a blip creating the alias then would leave no index.
+  it 'retries pointing the alias once after dropping a 0.2.0 collection' do
+    typesense_client.collections.create(described_class::Schema.definition('products_shop'))
+    attempts = 0
+    allow(provider.send(:index_layout)).to receive(:point!).and_wrap_original do |original, name, target|
+      attempts += 1 if name == 'products_shop'
+      raise Typesense::Error::ServerError, 'blip' if name == 'products_shop' && attempts == 1
+
+      original.call(name, target)
+    end
+    yield_batches([product(1)])
+
+    provider.reindex(relation)
+
+    expect(layout.alias_target('products_shop')).to match(layout.version_pattern)
+    expect(live_ids).to eq(['prod_1_en_USD'])
+  end
+
+  # Once the alias points at the new collection the reindex has succeeded;
+  # failing to drop what it replaced must not make the rake task fail.
+  it 'succeeds, and says so, when dropping a replaced collection fails' do
+    yield_batches([product(1)])
+    provider.reindex(relation)
+    allow(provider.send(:index_layout)).to receive(:drop!).and_raise(Typesense::Error::ServerError, 'busy')
+
+    expect(provider.reindex(relation)).to eq(1)
+    expect(layout.versioned_collections.size).to eq(2)
+    expect(live_ids).to eq(['prod_1_en_USD'])
+  end
+
   # A 0.2.0 rollback creates a real collection beside the alias, and it takes
   # requests by that name ahead of the alias; rolling forward must drop it.
   it 'drops a real collection a rollback created beside the alias' do

@@ -275,6 +275,19 @@ RSpec.describe SpreeTypesense::ProductPresenter do
       it 'emits nothing for a membership without a position' do
         expect(positioned_in({})).to eq({})
       end
+
+      # Spree 6 removes a deleted category's or collection's memberships in a
+      # later job (`dependent: :destroy_async`); until then they point at
+      # nothing, and must not fail the product's indexing.
+      it 'skips a membership whose collection or category is gone' do
+        orphaned = FakeCatalog::Product.new(prefixed_id: 'prod_orphan', names: { 'en' => 'Orphan' }, prices: { 'USD' => 1 })
+        allow(orphaned).to receive(:product_collections).and_return(
+          [FakeCatalog::Membership.new(nil, 1), FakeCatalog::Membership.new(FakeCatalog::Collection.new('coll_x'), 2)]
+        )
+        allow(orphaned).to receive(:product_categories).and_return([FakeCatalog::Membership.new(nil, 1)])
+
+        expect(positions(described_class.new(orphaned, store).call.first)).to eq('pos_coll_x' => 2)
+      end
     end
 
     it 'never reads the names 6.0 deprecated' do

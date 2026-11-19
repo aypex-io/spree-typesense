@@ -77,6 +77,18 @@ RSpec.describe SpreeTypesense::CircuitBreaker do
       expect(breaker.allow_request?).to be(true)
     end
 
+    # A probe killed by an exception outside StandardError (a request
+    # timeout, a thread kill) reports nothing; the breaker must not wait on
+    # it forever.
+    it 'lets another request probe once a probe has gone unanswered for a whole period' do
+      breaker.allow_request?
+
+      advance(29)
+      expect(breaker.allow_request?).to be(false)
+      advance(1)
+      expect(breaker.allow_request?).to be(true)
+    end
+
     it 'lets exactly one of many threads probe' do
       allowed = Array.new(20) { Thread.new { breaker.allow_request? } }.map(&:value)
 

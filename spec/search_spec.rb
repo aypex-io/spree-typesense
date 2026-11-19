@@ -100,6 +100,26 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
     end
   end
 
+  # A filter far longer than Typesense takes in a GET query string (4000
+  # characters): 30 colours by 30 sizes make 900 combination tokens. The
+  # search must still be answered by Typesense, not fall back.
+  context 'a long filter on Spree 6.x', if: SpreeTypesense.spree_6? do
+    it 'is answered by Typesense' do
+      colours = (1..30).map { |i| "optval_colour#{i.to_s.rjust(4, '0')}" }
+      sizes = (1..30).map { |i| "optval_size#{i.to_s.rjust(4, '0')}" }
+      token = described_class::QueryBuilder.combination_token([colours.first, sizes.first])
+      provider.index_batch([doc('prod_m', name: 'Herbal M').merge('option_value_ids' => [colours.first, sizes.first],
+                                                                  'option_value_combination_ids' => [token])])
+      allow(provider).to receive(:group_option_values_by_type).and_return(1 => colours, 2 => sizes)
+      allow(Spree::SearchProvider::Database).to receive(:new).and_return(instance_double(Spree::SearchProvider::Database))
+
+      result = provider.search_and_filter(scope: FakeScope.new(%w[prod_m]),
+                                          filters: { 'with_option_value_ids' => colours + sizes })
+
+      expect(result.products.map(&:prefixed_id)).to eq(%w[prod_m])
+    end
+  end
+
   # THE security test.
   it 'never returns a product missing from the authorized scope' do
     result = provider.search_and_filter(scope: FakeScope.new(%w[prod_2]), query: 'herbal')
