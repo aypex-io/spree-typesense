@@ -36,6 +36,10 @@
   but only under Solid Queue; this holds on any queue adapter (Sidekiq
   included).
 
+- **Fix: locale and store id are quoted in every search's filter** (#12).
+  A hyphenated locale (`en-US`) and a UUID store id now reach Typesense as
+  one backtick-quoted value, as channel ids already did.
+
 ### Upgrading
 
 On Spree 6, a store whose default market locale differs from

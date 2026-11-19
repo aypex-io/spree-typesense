@@ -22,12 +22,15 @@ module Spree
         #
         # `channel_id` narrows to the products published on that channel, as
         # core's storefront scope does (`for_channel`). Documents carry raw
-        # channel ids as strings; the value is quoted so a UUID stays whole.
+        # store and channel ids as strings. String values go into the filter
+        # in backticks, Typesense's string literal, so a UUID or a hyphenated
+        # locale (`en-US`) stays one value; anything that could close the
+        # quote is stripped first.
         def system_conditions(store:, locale:, currency:, channel_id: nil, now: Time.current)
-          conditions = ["store_ids:=#{store.id.to_i}"]
+          conditions = ["store_ids:=`#{store.id.to_s.gsub(/[^a-zA-Z0-9_-]/, '')}`"]
           conditions << "channel_ids:=`#{channel_id.to_s.gsub(/[^a-zA-Z0-9_-]/, '')}`" if channel_id.present?
           conditions << "status:=active"
-          conditions << "locale:=#{locale.to_s.gsub(/[^a-zA-Z_-]/, '')}"
+          conditions << "locale:=`#{locale.to_s.gsub(/[^a-zA-Z_-]/, '')}`"
           conditions << "currency:=#{currency.to_s.upcase.gsub(/[^A-Z]/, '')}"
           # available_on_i, NOT available_on: Typesense silently matches zero
           # documents for range operators on string fields. A product
