@@ -297,7 +297,10 @@ RSpec.describe Spree::SearchProvider::Typesense do
       typesense_client.collections[name].documents.search(q: '*', per_page: 100)['hits'].map { |h| h['document']['id'] }
     end
 
-    def store_collections = typesense_client.collections.retrieve.map { |c| c['name'] }.grep(/\Aproducts_shop/)
+    def store_collections
+      typesense_client.collections.retrieve.map { |c| c['name'] }
+                      .select { |name| name == layout.live_name || layout.version_pattern.match?(name) }
+    end
 
     describe 'during a reindex' do
       let(:building) { layout.new_version_name(1_800_000_000_000) }
