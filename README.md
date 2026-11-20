@@ -137,12 +137,16 @@ and with it the documents of products that were deleted or left the scope.
   `-price`, `name`, `-name`, `available_on`, `-available_on` and
   `best_selling`; any other sort, such as `created_at` or a `cf_*` sort, gets
   the default ranking. `cf_*` sorts are not offered.
-- **Option facet counts are per product.** With values of one option type
-  selected, the counts for another type's values count products that carry
-  the value on any variant: with Blue selected, XL counts a product selling a
-  Red XL beside a Blue S, though choosing XL then lists only products with a
-  Blue XL. The listing and its total are exact; only the counts beside the
-  values can run higher. Spree's Meilisearch provider counts the same way.
+- **Option facet counts with a selection take one more request.** With option
+  values selected, each value's count is the number of products choosing it
+  would list: those with a variant carrying it together with the other types'
+  selected values. With Blue selected, a product selling a Red XL beside a
+  Blue S does not count for XL. Typesense counts facets per document, which is
+  per product here, so these counts come from a count search per value, sent
+  after the faceted searches: one more request, or two past 50 values. Past
+  100 values, or for a selection the index answers only approximately (see
+  the next item), the rest count products carrying the value on any variant,
+  as Spree's Meilisearch provider counts them all.
 - **Values of more than six option types at once.** Values of
   two to six option types must sit on one variant, and the index answers that
   exactly through one token per set of a variant's values. Beyond six types

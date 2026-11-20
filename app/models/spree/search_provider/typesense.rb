@@ -119,6 +119,14 @@ module Spree
       # Needed by option/category facets; the price range reads stats instead.
       MAX_FACET_VALUES = 100
 
+      # The most searches Typesense takes in one multi_search (its default
+      # `limit_multi_searches`).
+      MULTI_SEARCH_LIMIT = 50
+
+      # The most option values counted by variant per facets request: two
+      # multi_searches. Values beyond it keep their count by product.
+      MAX_VARIANT_COUNTS = 100
+
       # See #schema_client.
       SCHEMA_CHANGE_TIMEOUT_SECONDS = 120
 
@@ -702,9 +710,45 @@ module Spree
         end
 
         results = request_typesense { execute_multi_search(searches) }
-        [results.first,
-         merge_disjunctive_facets(results.first, results.drop(1), option_type_ids),
+        type_of = option_type_of(results.flat_map { |result| option_value_counts(result).keys }.uniq)
+        distribution = merge_disjunctive_facets(results.first, results.drop(1), option_type_ids, type_of)
+        option_counts = request_typesense do
+          count_by_variant(distribution['option_value_ids'] || {}, type_of, query: query, base: base, grouped: grouped)
+        end
+        [results.first, distribution.merge('option_value_ids' => option_counts),
          Facets.normalize_stats(results.first['facet_counts'])]
+      end
+
+      # The option value counts, each as the number of products choosing that
+      # value would list: those with a variant carrying it together with the
+      # values selected of every other option type (#19). The faceted searches
+      # count a product carrying the value on any variant, so with Blue
+      # selected, a product selling a Red XL beside a Blue S counted for XL.
+      # A count search per value fixes that, sent in multi_searches after the
+      # faceted ones, which supply the values. A lone selected type's own
+      # values need none: nothing else is selected for them to sit with.
+      # Neither does a selection the combination tokens cannot answer exactly
+      # (see QueryBuilder.option_conditions), nor any value beyond
+      # MAX_VARIANT_COUNTS: those keep the faceted count. A value no product
+      # has by variant drops out, as Typesense leaves out a value it counts
+      # none of.
+      def count_by_variant(option_counts, type_of, query:, base:, grouped:)
+        selections = option_counts.keys.filter_map { |prefixed_id|
+          option_type_id = type_of[prefixed_id]
+          others = grouped.except(option_type_id)
+          next if option_type_id.nil? || others.empty?
+
+          conditions, exact = QueryBuilder.option_conditions(others.merge(option_type_id => [prefixed_id]))
+          [prefixed_id, conditions] if exact
+        }.first(MAX_VARIANT_COUNTS)
+        return option_counts if selections.empty?
+
+        searches = selections.map do |_prefixed_id, conditions|
+          search_params(query: query, conditions: base + conditions, sort: nil, page: 1, limit: 0)
+        end
+        found = searches.each_slice(MULTI_SEARCH_LIMIT).flat_map { |slice| execute_multi_search(slice) }
+        counted = selections.map(&:first).zip(found.map { |result| result['found'].to_i }).to_h
+        option_counts.merge(counted).reject { |_prefixed_id, count| count.zero? }
       end
 
       # The disjunctive facet searches, in one request.
@@ -746,18 +790,17 @@ module Spree
       # Start from the main (fully filtered) distribution, then for each option
       # type overwrite the counts of the values BELONGING TO THAT TYPE with the
       # counts from that type's own relaxed query. Values of other types keep
-      # the main query's counts. Mapping a value to its type needs the database,
-      # same lookup as +group_option_values_by_type+.
-      def merge_disjunctive_facets(main_result, relaxed_results, option_type_ids)
+      # the main query's counts. `type_of` maps a value to its type (see
+      # #option_type_of).
+      def merge_disjunctive_facets(main_result, relaxed_results, option_type_ids, type_of)
         distribution = Facets.normalize(main_result['facet_counts'])
         merged = (distribution['option_value_ids'] || {}).dup
 
         per_type = {}
         relaxed_results.each_with_index do |result, i|
-          per_type[option_type_ids[i]] = Facets.normalize(result['facet_counts'])['option_value_ids'] || {}
+          per_type[option_type_ids[i]] = option_value_counts(result)
         end
 
-        type_of = option_type_of(per_type.values.flat_map(&:keys).uniq)
         per_type.each do |option_type_id, relaxed_distribution|
           relaxed_distribution.each do |prefixed_id, count|
             merged[prefixed_id] = count if type_of[prefixed_id] == option_type_id
@@ -767,7 +810,10 @@ module Spree
         distribution.merge('option_value_ids' => merged)
       end
 
-      # { 'ov_red' => option_type_id, ... } in one query.
+      def option_value_counts(result) = Facets.normalize(result['facet_counts'])['option_value_ids'] || {}
+
+      # { 'ov_red' => option_type_id, ... } in one query, same lookup as
+      # +group_option_values_by_type+.
       def option_type_of(prefixed_ids)
         raw_ids = prefixed_ids.filter_map { |pid| Spree::OptionValue.decode_prefixed_id(pid) }
         by_raw_id = Spree::OptionValue.where(id: raw_ids).pluck(:id, :option_type_id).to_h
