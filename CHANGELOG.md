@@ -1,6 +1,6 @@
 # Changelog
 
-## 6.0.1 (unreleased)
+## 6.0.1 (2026-11-20)
 
 - **Reindex no longer orders the scope it batches** (#21). `find_in_batches`
   ignores a scoped order, so Rails logged "Scoped order is ignored" on every
