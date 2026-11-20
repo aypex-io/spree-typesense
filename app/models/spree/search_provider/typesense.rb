@@ -419,7 +419,9 @@ module Spree
         # so the scope reaches it without one (#21).
         scope.unscope(:order).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
           read_at = current_time_ms
-          documents = batch.flat_map { |product| presenter_class.new(product, store).call }
+          documents = Spree::Typesense::ProductPresenter.sharing_category_ancestors do
+            batch.flat_map { |product| presenter_class.new(product, store).call }
+          end
           documents = without_newer_writes(documents, into: into, read_at: read_at)
           next if documents.empty?
 

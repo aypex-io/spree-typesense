@@ -11,7 +11,23 @@ module Spree
     # manual sort, documents here carry a `pos_<grouping prefixed id>` field per
     # collection and category instead.
     class ProductPresenter
+      CATEGORY_ANCESTORS = :spree_typesense_category_ancestors
+      private_constant :CATEGORY_ANCESTORS
+
       attr_reader :product, :store
+
+      # Runs the block with the presenters built in it sharing the category
+      # ancestors they read: each category's are one query, so a reindex
+      # builds a batch's documents inside this and reads a category's
+      # ancestors once per batch rather than once per product (#24). Outside
+      # it, a presenter reads a category's once for itself.
+      def self.sharing_category_ancestors
+        outer = ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS]
+        ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS] = outer || {}
+        yield
+      ensure
+        ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS] = outer
+      end
 
       def initialize(product, store)
         @product = product
@@ -188,9 +204,14 @@ module Spree
       end
 
       def category_ids_with_ancestors
-        @category_ids_with_ancestors ||= product.categories.flat_map { |c|
-          c.self_and_ancestors.map(&:prefixed_id)
-        }.uniq
+        @category_ids_with_ancestors ||= product.categories.flat_map { |c| self_and_ancestor_ids(c) }.uniq
+      end
+
+      # The prefixed ids of the category and its ancestors, root first, read
+      # once per category (see .sharing_category_ancestors).
+      def self_and_ancestor_ids(category)
+        cache = ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS] || (@category_ancestors ||= {})
+        cache[category.prefixed_id] ||= category.self_and_ancestors.map(&:prefixed_id)
       end
 
       def variant_option_value_ids
@@ -229,8 +250,8 @@ module Spree
           grouping = membership.category
           next if grouping.nil? || membership.position.nil?
 
-          grouping.self_and_ancestors.each do |category|
-            acc[category.prefixed_id] = [acc[category.prefixed_id], membership.position].compact.min
+          self_and_ancestor_ids(grouping).each do |prefixed_id|
+            acc[prefixed_id] = [acc[prefixed_id], membership.position].compact.min
           end
         end
       end

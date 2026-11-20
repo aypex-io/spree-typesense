@@ -236,6 +236,45 @@ RSpec.describe Spree::Typesense::ProductPresenter do
       end
     end
 
+    # Each self_and_ancestors is a query (#24).
+    describe 'reading category ancestors' do
+      before do
+        [shirts, sale].each { |category| allow(category).to receive(:self_and_ancestors).and_call_original }
+      end
+
+      it "reads each category's ancestors once per product" do
+        documents
+
+        expect(shirts).to have_received(:self_and_ancestors).once
+        expect(sale).to have_received(:self_and_ancestors).once
+      end
+
+      let(:other) do
+        FakeCatalog::Product.new(prefixed_id: 'prod_other', names: { 'en' => 'Other' },
+                                 prices: { 'USD' => BigDecimal('5') }, categories: [shirts],
+                                 positions: { 'ctg_shirts' => 1 })
+      end
+
+      it 'reads them once across the presenters built while sharing them' do
+        other_document = described_class.sharing_category_ancestors do
+          described_class.new(product, store).call
+          described_class.new(other, store).call.first
+        end
+
+        expect(shirts).to have_received(:self_and_ancestors).once
+        expect(other_document[:category_ids]).to eq(%w[ctg_apparel ctg_shirts])
+        expect(other_document).to include('pos_ctg_apparel' => 1, 'pos_ctg_shirts' => 1)
+      end
+
+      it 'reads them again once the sharing ends' do
+        described_class.sharing_category_ancestors { described_class.new(product, store).call }
+
+        described_class.new(other, store).call
+
+        expect(shirts).to have_received(:self_and_ancestors).twice
+      end
+    end
+
     it 'never reads the names 6.0 deprecated' do
       allow(product).to receive(:taxons).and_call_original
       allow(product).to receive(:variants_including_master).and_call_original
