@@ -30,6 +30,20 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
     expect(result.products.map(&:prefixed_id)).to eq(%w[prod_1])
   end
 
+  # A product removed while a reindex is building leaves a marker in that
+  # collection (#27). One can reach the live collection, so no search may
+  # return or count it.
+  it 'never returns or counts a removal marker' do
+    provider.send(:mark_removed, 'prod_1', into: provider.collection_name, removed_at: 0)
+    scope = FakeScope.new(%w[prod_1 prod_2])
+
+    result = provider.search_and_filter(scope: scope)
+
+    expect(result.products.map(&:prefixed_id)).to contain_exactly('prod_1', 'prod_2')
+    expect(result.total_count).to eq(2)
+    expect(provider.filters(scope: scope).total_count).to eq(2)
+  end
+
   # THE multi-market test: the German/EUR document must not leak into an en/USD search.
   it 'never returns another market\'s copy of a product' do
     result = provider.search_and_filter(scope: FakeScope.new(%w[prod_1 prod_3]), query: 'herbal')

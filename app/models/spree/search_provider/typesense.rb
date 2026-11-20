@@ -90,6 +90,11 @@ module Spree
       # transiently several times in a row, and searches skip it for a while.
       class CircuitOpened < StandardError; end
 
+      # The status of a removal marker (see #mark_removed): not one of Spree's,
+      # so no search, which asks for `active`, can match it.
+      REMOVED_STATUS = '__removed'.freeze
+      private_constant :REMOVED_STATUS
+
       # Set once missing configuration has been logged; see #report_unavailable.
       UNCONFIGURED_LOGGED = Concurrent::AtomicBoolean.new(false)
 
@@ -211,7 +216,9 @@ module Spree
       #
       # Writes to the live collection and, while a reindex is filling one, to
       # that one too, so the change survives the swap. A collection being
-      # built that has since gone (its reindex died) is skipped.
+      # built that has since gone (its reindex died) is skipped. A product
+      # producing no documents leaves a removal marker in the collection being
+      # built (see #mark_removed).
       #
       # Raises ImportError (after the deletion) when Typesense rejects a
       # document, so the index job retries it.
@@ -228,7 +235,8 @@ module Spree
           rescue ImportError => e
             rejected ||= e
           end
-          remove_stale_documents(product.prefixed_id, documents, from: target, written_before: read_at)
+          kept = documents.empty? && !live ? mark_removed(product.prefixed_id, into: target, removed_at: read_at) : documents
+          remove_stale_documents(product.prefixed_id, kept, from: target, written_before: read_at)
         end
         raise rejected if rejected
 
@@ -335,10 +343,13 @@ module Spree
 
       # Composite ids mean one product maps to N documents (locale × currency),
       # so delete by filter on product_id rather than by document id. From the
-      # live collection and any collection a reindex is filling.
+      # live collection and any collection a reindex is filling, where a
+      # removal marker is left in their place (see #mark_removed).
       def remove_by_id(prefixed_id)
-        each_write_target do |target, _live|
-          delete_product_documents(prefixed_id, from: target)
+        removed_at = current_time_ms
+        each_write_target do |target, live|
+          kept = live ? [] : mark_removed(prefixed_id, into: target, removed_at: removed_at)
+          remove_stale_documents(prefixed_id, kept, from: target)
         end
         nil
       end
@@ -462,6 +473,32 @@ module Spree
 
       def document_product_id(document) = sanitize_prefixed_id(document[:product_id] || document['product_id'])
 
+      # A product removed while a reindex is building, or saved into
+      # producing no documents, leaves no document stamped `indexed_at` there
+      # for #without_newer_writes to find, so a batch that read it earlier
+      # would put its old documents back and take them live (#27). It leaves
+      # this marker in their place: a document stamped with the removal,
+      # which that check finds like any newer write, and which no search can
+      # match, being in no store and in status REMOVED_STATUS. It is written
+      # before the product's documents are deleted, so a batch importing in
+      # between has them deleted after it. The reindex deletes the markers
+      # once it is live. Returns the marker as written, or none when it could
+      # not be: the deletion goes ahead either way.
+      def mark_removed(prefixed_id, into:, removed_at:)
+        marker = { 'id' => "#{prefixed_id}__removed", 'product_id' => prefixed_id, 'locale' => '',
+                   'currency' => '', 'name' => '', 'status' => REMOVED_STATUS, 'in_stock' => false,
+                   'store_ids' => [], 'discontinue_on' => 0, 'units_sold_count' => 0 }
+        index_batch([marker], into: into, indexed_at: removed_at)
+        [marker]
+      rescue ImportError => e
+        Rails.logger.warn { "[spree_typesense] could not mark #{prefixed_id} removed in #{into}: #{e.message}" }
+        []
+      end
+
+      def delete_removal_markers(collection)
+        client.collections[collection].documents.delete(filter_by: "status:=`#{REMOVED_STATUS}`")
+      end
+
       # Forgets a reindex's collection: removes the marker while it is still
       # this reindex's, and drops the collection, leaving the live alias as
       # it was. Best effort, so the error that stopped the reindex is the one
@@ -528,6 +565,7 @@ module Spree
         point_live_alias(layout, building)
 
         after_swap("remove the #{layout.building_name} alias") { layout.release!(layout.building_name, building) }
+        after_swap('delete the removal markers') { delete_removal_markers(building) }
         replaced = after_swap('list the collections it replaced') do
           layout.versioned_collections.select { |name| name < building }
         end || []
@@ -584,13 +622,13 @@ module Spree
       end
 
       # Deletes the product's documents in `from` other than `documents`; all
-      # of them when `documents` is empty. Only documents written before
-      # `written_before` go: a later job's are its own business. Ids go into
+      # of them when `documents` is empty. With `written_before`, only
+      # documents written before it go: a later job's are its own business. Ids go into
       # the filter quoted in backticks, Typesense's string literal, because
       # locales such as `en-US` put a hyphen in them. An id that itself holds a
       # backtick cannot be quoted, so nothing is deleted then rather than risk
       # deleting the wrong documents.
-      def remove_stale_documents(prefixed_id, documents, from:, written_before:)
+      def remove_stale_documents(prefixed_id, documents, from:, written_before: nil)
         kept_ids = documents.map { |d| (d[:id] || d['id']).to_s }
         return delete_product_documents(prefixed_id, from: from, written_before: written_before) if kept_ids.empty?
 
@@ -599,10 +637,9 @@ module Spree
           return
         end
 
-        client.collections[from].documents.delete(
-          filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)} && " \
-                     "id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}] && indexed_at:<#{written_before.to_i}"
-        )
+        filter = "product_id:=#{sanitize_prefixed_id(prefixed_id)} && id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}]"
+        filter += " && indexed_at:<#{written_before.to_i}" if written_before
+        client.collections[from].documents.delete(filter_by: filter)
       rescue ::Typesense::Error::ObjectNotFound
         nil
       end

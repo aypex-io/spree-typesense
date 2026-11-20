@@ -92,6 +92,10 @@ and with it the documents of products that were deleted or left the scope.
   `products_<store code>__building`, and a product saved meanwhile is written
   to both, so the change survives the swap. A batch the reindex read before
   that save leaves the product out rather than overwrite the newer documents.
+  A product deleted meanwhile, or saved into having no documents (it lost its
+  last price, say), leaves a removal marker in the collection being filled,
+  which no search can match, so such a batch leaves it out too. The reindex
+  deletes the markers once it is live.
 - If a second reindex starts while one is running (a manual rake run during a
   deploy's, say), the second takes the marker and is the one that goes live.
   The first drops its collection when it ends, logs a warning and returns 0.

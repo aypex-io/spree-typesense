@@ -378,14 +378,33 @@ RSpec.describe Spree::SearchProvider::Typesense do
         expect(ids_in(building)).to eq(['prod_w_en_USD'])
       end
 
-      it 'removes a product from both' do
+      # In the building collection a removal marker takes their place, so the
+      # reindex does not put them back from an older read (#27).
+      it 'removes a product from both, leaving a removal marker in the building collection' do
         index_as('prod_w', [ws_doc('prod_w')])
         expect(ids_in(building)).to eq(['prod_w_en_USD'])
 
         provider.remove_by_id('prod_w')
 
         expect(ids_in('products_shop')).to eq([])
-        expect(ids_in(building)).to eq([])
+        expect(ids_in(building)).to eq(['prod_w__removed'])
+      end
+
+      it 'leaves a removal marker in the building collection for a product that produces no documents' do
+        index_as('prod_w', [ws_doc('prod_w')])
+
+        index_as('prod_w', [])
+
+        expect(ids_in('products_shop')).to eq([])
+        expect(ids_in(building)).to eq(['prod_w__removed'])
+      end
+
+      it "replaces a product's removal marker when it produces documents again" do
+        provider.remove_by_id('prod_w')
+
+        index_as('prod_w', [ws_doc('prod_w')])
+
+        expect(ids_in(building)).to eq(['prod_w_en_USD'])
       end
 
       it 'writes to the live collection when the one being built is gone' do
