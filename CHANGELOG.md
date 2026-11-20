@@ -9,7 +9,9 @@
   earlier one that finds the `__building` marker taken when it ends (or
   fails) drops its collection, leaves the live alias and the marker alone,
   and returns 0. It used to go live without the writes made since the newer
-  one started, and remove the newer one's marker.
+  one started, and remove the newer one's marker. If the newer one failed
+  instead, the earlier one raises `ReindexOverlapError` rather than go live
+  without those writes.
 - **A product saved during a reindex keeps its newer documents** (#23). A
   batch read before the save left out that product's documents rather than
   overwrite the ones the save wrote into the new collection, which used to

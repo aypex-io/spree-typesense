@@ -350,6 +350,30 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
       expect(layout.alias_target('products_shop__building')).to be_nil
     end
 
+    # The newer reindex can fail instead: it removes the marker and drops its
+    # collection, and nothing newer goes live. This one has still missed the
+    # writes made while the newer one held the marker, so it must neither go
+    # live nor end as though all were well.
+    it 'raises, leaving the live alias as it was, when the newer reindex failed' do
+      yield_batches([product(1)])
+      provider.reindex(relation)
+      live = layout.alias_target('products_shop')
+      newer = described_class.new(store)
+      allow(relation).to receive(:find_in_batches).with(batch_size: 500) do |**, &block|
+        block.call([product(2)])
+        sleep 0.01 # a later millisecond, so the newer collection's name sorts after this one's
+        failing = relation_yielding
+        allow(failing).to receive(:find_in_batches).and_raise('the newer reindex failed')
+        expect { newer.reindex(failing) }.to raise_error('the newer reindex failed')
+      end
+
+      expect { provider.reindex(relation) }.to raise_error(described_class::ReindexOverlapError, /run the reindex again/)
+      expect(layout.alias_target('products_shop')).to eq(live)
+      expect(layout.alias_target('products_shop__building')).to be_nil
+      expect(layout.versioned_collections).to eq([live])
+      expect(live_ids).to eq(['prod_1_en_USD'])
+    end
+
     it 'gives way, rather than raising, when it fails after a newer reindex took the marker' do
       yield_batches([product(1)])
       provider.reindex(relation)

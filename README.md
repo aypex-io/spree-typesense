@@ -95,6 +95,8 @@ and with it the documents of products that were deleted or left the scope.
 - If a second reindex starts while one is running (a manual rake run during a
   deploy's, say), the second takes the marker and is the one that goes live.
   The first drops its collection when it ends, logs a warning and returns 0.
+  If the second fails instead, the first raises `ReindexOverlapError`, as it
+  has missed the writes the second received: run the reindex again.
 - If Typesense rejects any document, or the reindex fails, the new collection
   is dropped and the alias left where it was: the store keeps the index it
   had, and the rake task fails naming the rejected documents.

@@ -26,6 +26,20 @@ module Spree
       # error, as multi_search does per search.
       class SearchError < ::Typesense::Error; end
 
+      # Raised by #reindex when a newer reindex took the `__building` marker
+      # from it and then stopped without going live: it failed, or someone
+      # removed the marker. The collection this reindex built has missed the
+      # single-product writes made meanwhile, so it is dropped rather than
+      # swapped in (#22).
+      class ReindexOverlapError < StandardError
+        # @param building [String] the collection this reindex built
+        def initialize(building)
+          super("a newer reindex took over while this one was building '#{building}', then stopped without " \
+                'going live; that collection missed the product writes made meanwhile, so it was dropped and ' \
+                'the live index left as it was: run the reindex again')
+        end
+      end
+
       # The network errors typesense-ruby 5.0's ApiCall retries on and, once
       # its retries are spent, raises as they are.
       NETWORK_ERRORS = [
@@ -140,7 +154,10 @@ module Spree
       # The one that started last holds the marker, so only it receives
       # single-product writes from then on, and only it goes live: an older
       # one that finds the marker taken when it ends, or fails, drops its
-      # collection and returns 0, leaving the newer one to swap in (#22).
+      # collection and returns 0, leaving the newer one to swap in (#22). If
+      # the newer one has instead stopped without going live, the older one
+      # has still missed those writes: it drops its collection and raises
+      # ReindexOverlapError.
       def reindex(scope = nil)
         scope ||= store.products
         layout = index_layout
@@ -151,12 +168,17 @@ module Spree
         begin
           indexed, failures = index_scope(scope, into: building)
         rescue StandardError => e
-          return give_way(layout, building, e) if superseded?(layout, building)
+          return give_way(layout, building, e) if marker_state(layout, building) == :superseded
 
           abandon_build(layout, building)
           raise
         end
-        return give_way(layout, building) if superseded?(layout, building)
+        case marker_state(layout, building)
+        when :superseded then return give_way(layout, building)
+        when :lost
+          abandon_build(layout, building)
+          raise ReindexOverlapError, building
+        end
 
         Rails.logger.info do
           "[spree_typesense] reindex complete: #{indexed} documents indexed, #{failures.size} failed"
@@ -444,13 +466,22 @@ module Spree
         Rails.logger.error { "[spree_typesense] could not clean up '#{building}': #{e.class}: #{e.message}" }
       end
 
-      # Whether a newer reindex has taken the marker from this one: it points
-      # at another collection, or is gone because that reindex has finished.
+      # Whose the marker is as this reindex of `building` ends:
+      # - :mine while it still points at `building`
+      # - :superseded when a newer reindex holds it, or has gone live (the
+      #   live alias points at a newer collection) and removed it
+      # - :lost when it is gone and nothing newer went live: the newer
+      #   reindex failed, or someone removed the marker
       # When the marker cannot be read, the reindex goes on as its own.
-      def superseded?(layout, building)
-        layout.alias_target(layout.building_name) != building
+      def marker_state(layout, building)
+        holder = layout.alias_target(layout.building_name)
+        return :mine if holder == building
+        return :superseded if holder
+
+        live = layout.alias_target(layout.live_name)
+        live && layout.version_pattern.match?(live) && live > building ? :superseded : :lost
       rescue StandardError
-        false
+        :mine
       end
 
       # A newer reindex took the marker while this one was filling
