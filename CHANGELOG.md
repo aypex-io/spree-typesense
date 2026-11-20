@@ -1,6 +1,6 @@
 # Changelog
 
-## 6.1.0 (2026-11-20)
+## 6.0.2 (2026-11-20)
 
 - **Option value counts count by variant** (#19). With option values
   selected, each value's count is the number of products choosing it would
