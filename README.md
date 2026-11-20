@@ -129,14 +129,22 @@ and with it the documents of products that were deleted or left the scope.
   product `scope`, such as Spree 6's buyer catalogs and audiences, is not:
   the index cannot express it. Spree's Meilisearch provider has the same
   limit. Search results are always intersected with the scope.
-- **Some filters and sorts are ignored.** The index answers `price_gte`,
-  `price_lte`, `in_stock`, `out_of_stock`, `in_category`, `in_categories`,
-  `in_collection` (Spree 6) and `with_option_value_ids`. It ignores
-  `price_between`, `in_taxon`, `search_by_name`, other ransack predicates such
-  as `name_cont`, and `cf_*` custom-field filters. It sorts by `price`,
-  `-price`, `name`, `-name`, `available_on`, `-available_on` and
-  `best_selling`; any other sort, such as `created_at` or a `cf_*` sort, gets
-  the default ranking. `cf_*` sorts are not offered.
+- **Other filters are answered by the `Database` provider.** The index
+  applies `price_gte`, `price_lte`, `price_between`, `in_stock`,
+  `out_of_stock`, `in_category`, `in_taxon`, `in_categories`, `in_collection`
+  and `with_option_value_ids`. A request carrying any other filter with a
+  value (`search_by_name`, `name_cont` or another Ransack predicate, a `cf_*`
+  custom-field filter), a malformed id or price in one of those, or only
+  option values that don't exist, is answered by Spree's `Database`
+  provider. That provider applies them all, so a listing is never wider than
+  asked for. It is logged at info, not reported, and leaves the circuit
+  breaker alone. `search_by_name` is not translated: it matches part of the
+  name, which Typesense's word matching does not, and a search has only one
+  text query.
+- **Some sorts are ignored.** The index sorts by `price`, `-price`, `name`,
+  `-name`, `available_on`, `-available_on` and `best_selling`; any other
+  sort, such as `created_at` or a `cf_*` sort, gets the default ranking.
+  `cf_*` sorts are not offered.
 - **Option facet counts with a selection take one more request.** With option
   values selected, each value's count is the number of products choosing it
   would list: those with a variant carrying it together with the other types'

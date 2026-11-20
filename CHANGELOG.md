@@ -1,5 +1,19 @@
 # Changelog
 
+## 6.0.3 (2026-11-20)
+
+- **A listing is never wider than its filters.** A filter the index has no
+  translation for was ignored, so the listing and its facets covered more
+  products than asked for. This applied to `search_by_name`, `name_cont` or
+  another Ransack predicate, and to `cf_*`. The same happened with a
+  malformed id or price, or with option values none of which exists. Spree's
+  `Database` provider now answers such a request, applying every filter. It
+  is logged at info, not reported, and the circuit breaker is left alone.
+- **`price_between` and `in_taxon` are applied by the index**: a price range
+  with both bounds included, and the older name for `in_category`.
+- **`in_stock` and `out_of_stock` set to `false`, `f` or `off`** filter nothing,
+  as Ransack reads them, rather than filtering by stock.
+
 ## 6.0.2 (2026-11-20)
 
 - **Option value counts count by variant** (#19). With option values

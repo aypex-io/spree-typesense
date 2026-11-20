@@ -290,6 +290,8 @@ module Spree
             scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit
           )
         end
+        return answer_from_database(filters, fallback) if answered_by_database?(filters)
+
         answer_through_breaker(query, fallback) do
           search_with_typesense(scope: scope, query: query, filters: filters, sort: sort, page: page, limit: limit)
         end
@@ -337,6 +339,8 @@ module Spree
       # As in #search_and_filter, only the Typesense requests are covered.
       def filters(scope:, query: nil, filters: {})
         fallback = -> { fallback_provider.filters(scope: scope, query: query, filters: filters) }
+        return answer_from_database(filters, fallback) if answered_by_database?(filters)
+
         answer_through_breaker(query, fallback) do
           result, distribution, stats = execute_faceted_search(query: query, filters: filters)
 
@@ -884,6 +888,29 @@ module Spree
           params[:max_facet_values] = MAX_FACET_VALUES
         end
         params
+      end
+
+      # Whether the request carries a filter the index cannot apply exactly
+      # (see QueryBuilder.unanswered_filters), or option values none of which
+      # exists: core's `with_option_value_ids` then lists nothing, where the
+      # index, with no value to filter by, would list everything.
+      def answered_by_database?(filters)
+        return true if QueryBuilder.unanswered_filters(filters).any?
+
+        option_ids = QueryBuilder.present_values(normalize_filters(filters)['with_option_value_ids'])
+        option_ids.any? && group_option_values_by_type(option_ids).empty?
+      end
+
+      # Spree's Database provider answers a request whose filters the index
+      # cannot all apply, so a listing is never wider than asked for. That is
+      # a choice, not Typesense failing: logged at info, reported nowhere, and
+      # left out of the circuit breaker.
+      def answer_from_database(filters, fallback)
+        Rails.logger.info do
+          unanswered = QueryBuilder.unanswered_filters(filters).presence || ['with_option_value_ids']
+          "[spree_typesense] the index cannot apply #{unanswered.join(', ')}; answering from the Database provider"
+        end
+        fallback.call
       end
 
       # Answers through Typesense unless the circuit breaker says it is

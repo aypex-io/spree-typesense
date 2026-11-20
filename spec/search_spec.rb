@@ -44,6 +44,29 @@ RSpec.describe Spree::SearchProvider::Typesense, '#search_and_filter' do
     expect(provider.filters(scope: scope).total_count).to eq(2)
   end
 
+  describe 'price_between' do
+    before do
+      provider.index_batch([doc('prod_4', name: 'Cheap', price: 5.0), doc('prod_5', name: 'Dear', price: 20.0),
+                            doc('prod_6', name: 'Dearer', price: 25.0)])
+    end
+
+    let(:scope) { FakeScope.new(%w[prod_1 prod_2 prod_4 prod_5 prod_6]) }
+
+    def between(*bounds) = provider.search_and_filter(scope: scope, filters: { 'price_between' => bounds })
+
+    it 'lists the products priced within it, both bounds included' do
+      expect(between('10', '20').products.map(&:prefixed_id)).to contain_exactly('prod_1', 'prod_2', 'prod_5')
+    end
+
+    # As core's `amount: low..high`.
+    it 'lists nothing for a range whose low bound is above its high one' do
+      result = between('20', '10')
+
+      expect(result.products).to be_empty
+      expect(result.total_count).to eq(0)
+    end
+  end
+
   # THE multi-market test: the German/EUR document must not leak into an en/USD search.
   it 'never returns another market\'s copy of a product' do
     result = provider.search_and_filter(scope: FakeScope.new(%w[prod_1 prod_3]), query: 'herbal')
