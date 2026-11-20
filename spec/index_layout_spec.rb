@@ -108,5 +108,32 @@ RSpec.describe Spree::SearchProvider::Typesense::IndexLayout do
       expect(layout.alias_target('products_shop')).to be_nil
       expect { layout.unpoint!('products_shop') }.not_to raise_error
     end
+
+    # A reindex removes the `__building` marker when it is done with it, but a
+    # newer reindex may have taken the marker since (#22).
+    describe '#release!' do
+      let(:newer) { 'products_shop_v1763000999999' }
+
+      it 'removes an alias that still points at the collection' do
+        make(version)
+        layout.point!('products_shop__building', version)
+
+        expect(layout.release!('products_shop__building', version)).to be(true)
+        expect(layout.alias_target('products_shop__building')).to be_nil
+      end
+
+      it 'leaves an alias that points at another collection' do
+        make(version)
+        make(newer)
+        layout.point!('products_shop__building', newer)
+
+        expect(layout.release!('products_shop__building', version)).to be(false)
+        expect(layout.alias_target('products_shop__building')).to eq(newer)
+      end
+
+      it 'is fine with no alias' do
+        expect(layout.release!('products_shop__building', version)).to be(false)
+      end
+    end
   end
 end

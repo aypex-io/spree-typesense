@@ -33,17 +33,36 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
     end
   end
 
+  # A relation with no order, yielding these batches, as #reindex reads one.
+  def relation_yielding(*batches)
+    scope = double('ActiveRecord::Relation')
+    allow(scope).to receive(:unscope).with(:order).and_return(scope)
+    allow(scope).to receive(:preload_associations_lazily).and_return(scope)
+    allow(scope).to receive(:find_in_batches).with(batch_size: 500) do |**, &block|
+      batches.each { |batch| block.call(batch) }
+    end
+    scope
+  end
+
   def collection_names = typesense_client.collections.retrieve.map { |c| c['name'] }
   def live_ids = ids_in(provider.collection_name)
+  def live_names = names_in(provider.collection_name)
 
   def ids_in(name)
     typesense_client.collections[name].documents.search(q: '*', per_page: 100)['hits'].map { |h| h['document']['id'] }
   end
 
+  def names_in(name)
+    typesense_client.collections[name].documents.search(q: '*', per_page: 100)['hits']
+                    .to_h { |h| [h['document']['id'], h['document']['name']] }
+  end
+
+  def now_ms = Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond)
+
   before do
     reset_typesense_index!('shop')
     reset_typesense_index!('shop_v2')
-    allow(relation).to receive(:reorder).with(id: :asc).and_return(relation)
+    allow(relation).to receive(:unscope).with(:order).and_return(relation)
     allow(relation).to receive(:preload_associations_lazily).and_return(relation)
     stub_presenter({})
   end
@@ -66,6 +85,22 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
     yield_batches([product(3)])
 
     expect(provider.reindex(relation)).to eq(1)
+  end
+
+  # find_in_batches walks by primary key and ignores a scoped order: Rails
+  # warns "Scoped order is ignored", or under error_on_ignored_order raises
+  # before reading a row (#21). The ordered double does what Rails does then.
+  it 'hands find_in_batches the scope without its order' do
+    ordered = double('ActiveRecord::Relation (ordered)')
+    allow(ordered).to receive(:reorder).and_return(ordered)
+    allow(ordered).to receive(:unscope).with(:order).and_return(relation)
+    allow(ordered).to receive(:preload_associations_lazily).and_return(ordered)
+    allow(ordered).to receive(:find_in_batches)
+      .and_raise(ArgumentError, 'Scoped order is ignored, use :cursor with :order to configure custom order.')
+    yield_batches([product(1)])
+
+    expect(provider.reindex(ordered)).to eq(1)
+    expect(live_ids).to eq(['prod_1_en_USD'])
   end
 
   it 'skips a batch that produces no documents' do
@@ -253,6 +288,169 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
       expect(layout.alias_target('products_shop__building')).to be_nil
       expect(layout.versioned_collections).to eq([live])
       expect(live_ids).to eq(['prod_1_en_USD'])
+    end
+  end
+
+  # Reindexes can overlap: someone runs `rake spree:search:reindex` while the
+  # deploy hook's is still going, say. There is one `__building` marker, and
+  # the reindex that started last holds it, so only that one receives
+  # single-product writes from then on, and only that one may go live (#22).
+  describe 'when a newer reindex starts while one is running' do
+    let(:logged) { [] }
+
+    before do
+      logger = Logger.new(File::NULL)
+      %i[info warn error].each { |level| allow(logger).to receive(level) { |msg = nil, &blk| logged << (msg || blk&.call) } }
+      allow(Rails).to receive(:logger).and_return(logger)
+    end
+
+    # What a reindex does first: create its collection, then take the marker.
+    def start_newer_reindex
+      newer = layout.new_version_name(now_ms + 60_000)
+      typesense_client.collections.create(described_class::Schema.definition(newer))
+      layout.point!('products_shop__building', newer)
+      newer
+    end
+
+    it 'gives way: drops its own collection, leaves the live alias and the newer marker, and indexes nothing' do
+      yield_batches([product(1)])
+      provider.reindex(relation)
+      live = layout.alias_target('products_shop')
+      newer = nil
+      allow(relation).to receive(:find_in_batches).with(batch_size: 500) do |**, &block|
+        block.call([product(2)])
+        newer = start_newer_reindex
+      end
+
+      expect(provider.reindex(relation)).to eq(0)
+      expect(layout.alias_target('products_shop')).to eq(live)
+      expect(layout.alias_target('products_shop__building')).to eq(newer)
+      expect(layout.versioned_collections).to contain_exactly(live, newer)
+      expect(live_ids).to eq(['prod_1_en_USD'])
+      expect(logged.grep(/newer reindex/)).not_to be_empty
+    end
+
+    # The newer reindex finishing first drops this one's collection, as it
+    # drops every collection older than its own.
+    it 'gives way when the newer reindex has already gone live and dropped its collection' do
+      yield_batches([product(1)])
+      provider.reindex(relation)
+      newer = described_class.new(store)
+      allow(newer).to receive(:presenter_class).and_return(provider.send(:presenter_class))
+      allow(relation).to receive(:find_in_batches).with(batch_size: 500) do |**, &block|
+        block.call([product(2)])
+        sleep 0.01 # a later millisecond, so the newer collection's name sorts after this one's
+        newer.reindex(relation_yielding([product(3)]))
+        block.call([product(4)])
+      end
+
+      expect(provider.reindex(relation)).to eq(0)
+      expect(live_ids).to eq(['prod_3_en_USD'])
+      expect(layout.versioned_collections).to eq([layout.alias_target('products_shop')])
+      expect(layout.alias_target('products_shop__building')).to be_nil
+    end
+
+    # The newer reindex can fail instead: it removes the marker and drops its
+    # collection, and nothing newer goes live. This one has still missed the
+    # writes made while the newer one held the marker, so it must neither go
+    # live nor end as though all were well.
+    it 'raises, leaving the live alias as it was, when the newer reindex failed' do
+      yield_batches([product(1)])
+      provider.reindex(relation)
+      live = layout.alias_target('products_shop')
+      newer = described_class.new(store)
+      allow(relation).to receive(:find_in_batches).with(batch_size: 500) do |**, &block|
+        block.call([product(2)])
+        sleep 0.01 # a later millisecond, so the newer collection's name sorts after this one's
+        failing = relation_yielding
+        allow(failing).to receive(:find_in_batches).and_raise('the newer reindex failed')
+        expect { newer.reindex(failing) }.to raise_error('the newer reindex failed')
+      end
+
+      expect { provider.reindex(relation) }.to raise_error(described_class::ReindexOverlapError, /run the reindex again/)
+      expect(layout.alias_target('products_shop')).to eq(live)
+      expect(layout.alias_target('products_shop__building')).to be_nil
+      expect(layout.versioned_collections).to eq([live])
+      expect(live_ids).to eq(['prod_1_en_USD'])
+    end
+
+    it 'gives way, rather than raising, when it fails after a newer reindex took the marker' do
+      yield_batches([product(1)])
+      provider.reindex(relation)
+      live = layout.alias_target('products_shop')
+      newer = nil
+      allow(relation).to receive(:find_in_batches).with(batch_size: 500) do
+        newer = start_newer_reindex
+        raise 'database went away'
+      end
+
+      expect(provider.reindex(relation)).to eq(0)
+      expect(layout.alias_target('products_shop')).to eq(live)
+      expect(layout.alias_target('products_shop__building')).to eq(newer)
+      expect(layout.versioned_collections).to contain_exactly(live, newer)
+      expect(logged.grep(/database went away/)).not_to be_empty
+    end
+
+    # A newer reindex can start between this one's last look at the marker
+    # and its removing it. It must keep the marker, and its collection.
+    it 'leaves the marker of a reindex that starts while this one goes live' do
+      yield_batches([product(1)])
+      newer = nil
+      allow(provider.send(:index_layout)).to receive(:point!).and_wrap_original do |original, name, target|
+        original.call(name, target)
+        newer = start_newer_reindex if name == 'products_shop' && newer.nil?
+      end
+
+      provider.reindex(relation)
+
+      expect(layout.alias_target('products_shop__building')).to eq(newer)
+      expect(collection_names).to include(newer)
+    end
+  end
+
+  # A product saved during a reindex is written to the collection being
+  # built too, through the marker. When that write lands after the reindex
+  # read the product but before it imports the batch, the batch's document
+  # is the older one, and must not replace the write's (#23).
+  describe 'when a product is saved while the reindex holds an older read of it' do
+    let(:saved) { double('Spree::Product#1 (saved)', id: 1, prefixed_id: 'prod_1') }
+
+    before { bootstrap_index!(provider) }
+
+    # Building product 1's document from the batch runs `write` first: a save
+    # whose index job lands between the reindex's read and its import.
+    def stub_presenter_writing_midway(write)
+      presenter_class = class_double('Spree::Typesense::ProductPresenter')
+      allow(provider).to receive(:presenter_class).and_return(presenter_class)
+      allow(presenter_class).to receive(:new) do |p, _store|
+        next instance_double(Spree::Typesense::ProductPresenter, call: [doc_for(1, name: 'Renamed mid-reindex')]) if p.equal?(saved)
+
+        presenter = instance_double(Spree::Typesense::ProductPresenter)
+        allow(presenter).to receive(:call) do
+          write.call if p.id == 1
+          [doc_for(p.id)]
+        end
+        presenter
+      end
+    end
+
+    it "keeps the save's document, and does not count the batch's" do
+      yield_batches([product(1), product(2)])
+      stub_presenter_writing_midway(-> { provider.index(saved) })
+
+      expect(provider.reindex(relation)).to eq(1)
+      expect(live_names).to eq('prod_1_en_USD' => 'Renamed mid-reindex', 'prod_2_en_USD' => 'Product 2')
+    end
+
+    it 'still replaces a document written from a read older than the batch' do
+      yield_batches([product(1)])
+      stub_presenter_writing_midway(lambda {
+        building = layout.alias_target('products_shop__building')
+        provider.send(:index_batch, [doc_for(1, name: 'Written from an older read')], into: building, indexed_at: 0)
+      })
+
+      expect(provider.reindex(relation)).to eq(1)
+      expect(live_names).to eq('prod_1_en_USD' => 'Product 1')
     end
   end
 end

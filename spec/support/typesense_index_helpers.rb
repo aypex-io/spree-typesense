@@ -5,7 +5,7 @@
 
 # A relation with no products, as #reindex reads one.
 class EmptyProductScope
-  def reorder(*) = self
+  def unscope(*) = self
   def preload_associations_lazily = self
   def find_in_batches(**) = nil
 end

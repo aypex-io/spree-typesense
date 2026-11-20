@@ -26,6 +26,20 @@ module Spree
       # error, as multi_search does per search.
       class SearchError < ::Typesense::Error; end
 
+      # Raised by #reindex when a newer reindex took the `__building` marker
+      # from it and then stopped without going live: it failed, or someone
+      # removed the marker. The collection this reindex built has missed the
+      # single-product writes made meanwhile, so it is dropped rather than
+      # swapped in (#22).
+      class ReindexOverlapError < StandardError
+        # @param building [String] the collection this reindex built
+        def initialize(building)
+          super("a newer reindex took over while this one was building '#{building}', then stopped without " \
+                'going live; that collection missed the product writes made meanwhile, so it was dropped and ' \
+                'the live index left as it was: run the reindex again')
+        end
+      end
+
       # The network errors typesense-ruby 5.0's ApiCall retries on and, once
       # its retries are spent, raises as they are.
       NETWORK_ERRORS = [
@@ -114,7 +128,7 @@ module Spree
       end
 
       # Mirrors meilisearch.rb#reindex: default scope is store.products (not
-      # Spree::Product.where(store_id:)), batch size 500, deterministic order,
+      # Spree::Product.where(store_id:)), batch size 500, in primary key order,
       # lazy-preloaded associations. Returns the number of DOCUMENTS indexed
       # (not products — one product can emit N locale x currency documents).
       #
@@ -135,6 +149,15 @@ module Spree
       # names them all, so `rake spree:search:reindex` fails visibly; the new
       # collection is then dropped and the live alias left where it was, so
       # no product goes missing from search. Any other error does the same.
+      #
+      # Reindexes can overlap (a manual rake run during the deploy hook's).
+      # The one that started last holds the marker, so only it receives
+      # single-product writes from then on, and only it goes live: an older
+      # one that finds the marker taken when it ends, or fails, drops its
+      # collection and returns 0, leaving the newer one to swap in (#22). If
+      # the newer one has instead stopped without going live, the older one
+      # has still missed those writes: it drops its collection and raises
+      # ReindexOverlapError.
       def reindex(scope = nil)
         scope ||= store.products
         layout = index_layout
@@ -144,9 +167,17 @@ module Spree
 
         begin
           indexed, failures = index_scope(scope, into: building)
-        rescue StandardError
+        rescue StandardError => e
+          return give_way(layout, building, e) if marker_state(layout, building) == :superseded
+
           abandon_build(layout, building)
           raise
+        end
+        case marker_state(layout, building)
+        when :superseded then return give_way(layout, building)
+        when :lost
+          abandon_build(layout, building)
+          raise ReindexOverlapError, building
         end
 
         Rails.logger.info do
@@ -365,9 +396,13 @@ module Spree
       def index_scope(scope, into:)
         indexed = 0
         failures = []
-        scope.reorder(id: :asc).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
+        # find_in_batches walks by primary key and ignores a scoped order,
+        # which Rails warns about, or rejects under error_on_ignored_order,
+        # so the scope reaches it without one (#21).
+        scope.unscope(:order).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
           read_at = current_time_ms
           documents = batch.flat_map { |product| presenter_class.new(product, store).call }
+          documents = without_newer_writes(documents, into: into, read_at: read_at)
           next if documents.empty?
 
           accepted = documents.size
@@ -383,14 +418,90 @@ module Spree
         [indexed, failures]
       end
 
-      # Forgets a reindex's collection: removes the marker and drops it,
-      # leaving the live alias as it was. Best effort, so the error that
-      # stopped the reindex is the one raised.
+      # The batch's documents, less those of products a single-product write
+      # (#index) has put into `into` since the batch was read (#23). That
+      # write read the product later, so its documents are the newer ones:
+      # importing the batch's over them would take the older ones live. A
+      # write landing between this lookup and the import can still be
+      # overwritten, but that window is one request, where the batch's is
+      # the time it takes to build its documents.
+      def without_newer_writes(documents, into:, read_at:)
+        return documents if documents.empty?
+
+        newer = product_ids_written_since(documents.map { |d| document_product_id(d) }.uniq, into: into, since: read_at)
+        return documents if newer.empty?
+
+        Rails.logger.info do
+          "[spree_typesense] left out #{newer.sort.join(', ')}: saved since this batch was read, so #{into} holds newer documents"
+        end
+        documents.reject { |d| newer.include?(document_product_id(d)) }
+      end
+
+      # Which of the products have a document in `into` stamped `since` or
+      # later: one facet search, sent as a POST, as a batch's ids are longer
+      # than Typesense's GET limit allows.
+      def product_ids_written_since(product_ids, into:, since:)
+        quoted = product_ids.map { |id| "`#{id}`" }.join(',')
+        response = client.multi_search.perform(
+          { searches: [{ collection: into, q: '*', per_page: 0,
+                         filter_by: "product_id:=[#{quoted}] && indexed_at:>=#{since.to_i}",
+                         facet_by: 'product_id', max_facet_values: product_ids.size }] }
+        )
+        result = Array(response['results']).first || {}
+        raise search_error_for(result) if result['error']
+
+        (Facets.normalize(result['facet_counts'])['product_id'] || {}).keys
+      end
+
+      def document_product_id(document) = sanitize_prefixed_id(document[:product_id] || document['product_id'])
+
+      # Forgets a reindex's collection: removes the marker while it is still
+      # this reindex's, and drops the collection, leaving the live alias as
+      # it was. Best effort, so the error that stopped the reindex is the one
+      # raised.
       def abandon_build(layout, building)
-        layout.unpoint!(layout.building_name)
+        layout.release!(layout.building_name, building)
         layout.drop!(building)
       rescue StandardError => e
         Rails.logger.error { "[spree_typesense] could not clean up '#{building}': #{e.class}: #{e.message}" }
+      end
+
+      # Whose the marker is as this reindex of `building` ends:
+      # - :mine while it still points at `building`
+      # - :superseded when a newer reindex holds it, or has gone live (the
+      #   live alias points at a newer collection) and removed it
+      # - :lost when it is gone and nothing newer went live: the newer
+      #   reindex failed, or someone removed the marker
+      # When the marker cannot be read, the reindex goes on as its own.
+      def marker_state(layout, building)
+        holder = layout.alias_target(layout.building_name)
+        return :mine if holder == building
+        return :superseded if holder
+
+        live = layout.alias_target(layout.live_name)
+        live && layout.version_pattern.match?(live) && live > building ? :superseded : :lost
+      rescue StandardError
+        :mine
+      end
+
+      # A newer reindex took the marker while this one was filling
+      # `building`, so `building` has missed the single-product writes made
+      # since, and the newer one will swap in a collection that has them.
+      # Drops `building`, leaves the live alias and the marker alone, and
+      # reports nothing indexed. A failure of this reindex is logged: the
+      # newer one meets it too, if it is not passing.
+      def give_way(layout, building, error = nil)
+        Rails.logger.warn do
+          "[spree_typesense] a newer reindex took over while this one was building #{building}" \
+            "#{" (and this one failed: #{error.class}: #{error.message})" if error}; " \
+            "dropping #{building} and leaving #{layout.live_name} to the newer reindex"
+        end
+        begin
+          layout.drop!(building)
+        rescue StandardError => e
+          Rails.logger.warn { "[spree_typesense] could not drop '#{building}' (#{e.class}: #{e.message}); the next reindex will" }
+        end
+        0
       end
 
       # Points the live alias at the collection just built, then drops what
@@ -409,7 +520,7 @@ module Spree
         layout.drop!(layout.live_name) if legacy
         point_live_alias(layout, building)
 
-        after_swap("remove the #{layout.building_name} alias") { layout.unpoint!(layout.building_name) }
+        after_swap("remove the #{layout.building_name} alias") { layout.release!(layout.building_name, building) }
         replaced = after_swap('list the collections it replaced') do
           layout.versioned_collections.select { |name| name < building }
         end || []
