@@ -84,6 +84,18 @@ RSpec.describe Spree::Typesense::ProductPresenter do
     expect(documents.map { |d| d[:id] }).to eq(%w[prod_shirt_en_USD prod_shirt_en_EUR prod_shirt_de_EUR])
   end
 
+  it 'emits one document per currency × locale when two markets share both' do
+    # A Rest-of-World market selling in USD beside the US market. Its locales
+    # are listed in another order, so it is not equal to `us` as a value.
+    row = FakeCatalog::Market.new(currency: 'USD', supported_locales_list: %w[de en], default_locale: 'en')
+    shared = FakeCatalog::Store.new(id: 7, code: 'presenter', markets: [us, eu, row], default_market: us,
+                                    supported_currencies_list: [FakeCatalog::Currency.new('USD')])
+
+    ids = described_class.new(product, shared).call.map { |d| d[:id] }
+
+    expect(ids).to eq(%w[prod_shirt_en_USD prod_shirt_en_EUR prod_shirt_de_EUR prod_shirt_de_USD])
+  end
+
   it 'falls back to the default locale for untranslated fields' do
     expect(document('de', 'EUR')).to include(name: 'Leinenhemd', slug: 'linen-shirt')
   end

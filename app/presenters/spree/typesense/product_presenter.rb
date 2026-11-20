@@ -1,7 +1,7 @@
 module Spree
   module Typesense
     # Builds the Typesense documents for a product: flat, one per
-    # (market × locale) the product is priced in.
+    # (currency × locale) the store's markets sell in and the product is priced in.
     #
     # The fields follow spree_meilisearch 6.0's presenter (categories,
     # option `label`s, storefront-visible custom fields, a plain-text
@@ -18,7 +18,8 @@ module Spree
         @store = store
       end
 
-      # Returns an array of documents — one per market × locale combination.
+      # Returns an array of documents — one per currency × locale the store's
+      # markets sell in.
       # Each document has flat name, description, price fields (no dynamic suffixes).
       def call
         # Indexing runs in a job or a rake task, where nothing has named the
@@ -141,11 +142,15 @@ module Spree
         end
       end
 
-      # Returns all market × locale pairs for this store
+      # The market × locale pairs of this store, one per currency and locale. A
+      # document is identified by its locale and currency, and nothing in it
+      # depends on the market (the price is the product's in that currency), so
+      # two markets sharing both (a Rest-of-World market selling in USD beside
+      # the US one) would otherwise build and send the same document twice.
       def market_locale_pairs
-        @market_locale_pairs ||= store.markets.flat_map do |market|
+        @market_locale_pairs ||= store.markets.flat_map { |market|
           market.supported_locales_list.map { |locale| [market, locale] }
-        end
+        }.uniq { |market, locale| [market.currency, locale.to_s] }
       end
 
       def default_locale
