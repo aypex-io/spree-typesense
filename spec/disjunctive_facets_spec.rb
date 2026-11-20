@@ -129,6 +129,81 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
     end
   end
 
+  # With three types selected, each type's relaxed search must drop only its
+  # own selection and keep BOTH others, and each type's counts must come from
+  # its own search. Two types cannot tell those apart from keeping only the
+  # first or the last other type, or from reading the wrong search's counts.
+  # Each relaxed search here asks for two-value combination tokens (#25).
+  context 'across three option types' do
+    let(:size) { FakeOptionType.new(prefixed_id: 'optt_size', name: 'Size', label: 'Size', kind: 'text') }
+    let(:material) do
+      FakeOptionType.new(prefixed_id: 'optt_material', name: 'Material', label: 'Material', kind: 'text')
+    end
+
+    def value(name, type_id, type, position)
+      FakeOptionValue.new(id: name, prefixed_id: "ov_#{name}", name: name, label: name.capitalize,
+                          position: position, color_code: nil, option_type_id: type_id, option_type: type,
+                          image: FakeImage.new(attached: false))
+    end
+
+    # A product with these variants, each a list of option value ids.
+    def doc_with_variants(pid, *variants)
+      doc(pid, variants.flatten.uniq).merge(
+        'option_value_combination_ids' => variants.flat_map { |ids| single_variant_tokens(ids) }.uniq
+      )
+    end
+
+    before do
+      reset_typesense_index!(store.code)
+      bootstrap_index!(provider)
+      provider.index_batch([
+        doc('prod_1', %w[ov_red ov_small ov_cotton]),
+        doc('prod_2', %w[ov_blue ov_small ov_cotton]),
+        doc('prod_3', %w[ov_red ov_large ov_cotton]),
+        doc('prod_4', %w[ov_red ov_large ov_cotton]),
+        doc('prod_5', %w[ov_red ov_small ov_wool]),
+        doc('prod_6', %w[ov_red ov_small ov_wool]),
+        doc('prod_7', %w[ov_red ov_small ov_wool]),
+        doc('prod_8', %w[ov_green ov_large ov_wool]),
+        # Small and cotton, but never on one variant: no colour count for it.
+        doc_with_variants('prod_9', %w[ov_blue ov_small ov_wool], %w[ov_green ov_large ov_cotton])
+      ])
+      green = value('green', 1, colour, 3)
+      stub_ar_lookup(Spree::OptionValue, [red, blue, green, value('small', 2, size, 1), value('large', 2, size, 2),
+                                          value('cotton', 3, material, 1), value('wool', 3, material, 2)])
+    end
+
+    subject(:result) do
+      allow(provider).to receive(:group_option_values_by_type)
+        .and_return(1 => ['ov_red'], 2 => ['ov_small'], 3 => ['ov_cotton'])
+      provider.filters(scope: FakeScope.new((1..9).map { |n| "prod_#{n}" }),
+                       filters: { 'with_option_value_ids' => %w[ov_red ov_small ov_cotton] })
+    end
+
+    def counts_for(type_id)
+      result.filters.find { |f| f[:id] == type_id }[:options].to_h { |o| [o[:id], o[:count]] }
+    end
+
+    it 'counts only the products with a variant of all three selected values' do
+      expect(result.total_count).to eq(1)
+    end
+
+    # Small and cotton on one variant: prod_1 (red) and prod_2 (blue).
+    it 'counts colours keeping both size and material' do
+      expect(counts_for('optt_colour')).to eq('ov_red' => 1, 'ov_blue' => 1)
+    end
+
+    # Red and cotton on one variant: prod_1 (small), prod_3 and prod_4 (large).
+    it 'counts sizes keeping both colour and material' do
+      expect(counts_for('optt_size')).to eq('ov_small' => 1, 'ov_large' => 2)
+    end
+
+    # Red and small on one variant: prod_1 (cotton), prod_5 to prod_7 (wool).
+    it 'counts materials keeping both colour and size' do
+      expect(counts_for('optt_material')).to eq('ov_cotton' => 1, 'ov_wool' => 3)
+    end
+  end
+
   # THE SHARPEST ENGINE DIVERGENCE IN THIS GEM. A single search raises
   # Typesense::Error::* on a bad filter or a missing collection; multi_search
   # answers HTTP 200 and puts {error, code} in the individual sub-result. A
