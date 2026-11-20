@@ -43,12 +43,12 @@ See [CHANGELOG.md](CHANGELOG.md) for what each release changes.
 
 Searches and filter facets answer from Spree's `Database` provider whenever
 Typesense cannot answer: the connection is refused, the request times out,
-Typesense returns a 5xx, or it rejects the query (a missing collection, a
+Typesense returns a 5xx or rate limits (429), or it rejects the query (a missing collection, a
 filter on a field the collection lacks). On Spree 6 the `Database` provider is
 built with the same `audience:`, so a back-office search stays one. Correct
 results, more slowly, beat an empty page. Each failure is logged at error level
 and reported through `Rails.error` as handled: as a warning when it is
-transient (a timeout, a 5xx, a lost connection), and as an error when it needs
+transient (a timeout, a 5xx, a 429, a lost connection), and as an error when it needs
 someone to act (a rejected query, a missing collection, a bad API key, missing
 configuration), so a broken index does not go unnoticed.
 
@@ -64,7 +64,7 @@ Indexing keeps a 5 second timeout and one retry, and Spree's index jobs retry
 on failure.
 
 During an outage each process stops trying after a while. After three
-transient failures in a row (timeouts, 5xx, lost connections) it skips
+transient failures in a row (timeouts, 5xx, 429s, lost connections) it skips
 Typesense for 30 seconds: searches and facets answer from the `Database`
 provider at once, with nothing logged per search. Opening is logged once at
 error level and reported once through `Rails.error` as a warning

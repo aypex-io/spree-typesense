@@ -180,10 +180,17 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
     allow(Rails).to receive(:error).and_return(reporter)
   end
 
-  # A transient failure (a timeout, a 5xx, a lost connection) is reported as a
-  # warning. One that will not pass by itself (a rejected query from schema
-  # drift, a missing collection, a bad key) is reported as an error, or a
-  # broken index could go unnoticed while the Database provider answers.
+  # What typesense-ruby raises for a status it has no class for, 429 among
+  # them: an HTTPError holding the response.
+  http_error = lambda do |status, message|
+    Typesense::Error::HTTPError.new(response: Faraday::Response.new(status: status)).exception(message)
+  end
+
+  # A transient failure (a timeout, a 5xx, a lost connection, rate limiting)
+  # is reported as a warning. One that will not pass by itself (a rejected
+  # query from schema drift, a missing collection, a bad key) is reported as
+  # an error, or a broken index could go unnoticed while the Database
+  # provider answers.
   {
     'a read timeout' => [Faraday::TimeoutError.new('timed out'), :warning],
     "the client's own timeout error" => [Typesense::Error::TimeoutError.new('timed out'), :warning],
@@ -191,6 +198,8 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
     'a refused connection' => [Faraday::ConnectionFailed.new('Connection refused'), :warning],
     'an unreachable host' => [Errno::EHOSTUNREACH.new, :warning],
     'a reset connection' => [Errno::ECONNRESET.new, :warning],
+    'a 429, Typesense rate limiting' => [http_error.call(429, 'Rate limit exceeded'), :warning],
+    'any other status the client has no class for' => [http_error.call(302, 'Found'), :error],
     'a 400, such as a filter on a field the collection lacks' =>
       [Typesense::Error::RequestMalformed.new('Could not find a filter field named `collection_ids` in the schema.'),
        :error],
@@ -270,6 +279,29 @@ RSpec.describe Spree::SearchProvider::Typesense, 'when Typesense fails' do
       search
 
       expect(breaker.state).to eq(:closed)
+    end
+
+    # Rate limiting passes by itself, and sending every search to a
+    # rate-limited Typesense keeps it rate limited.
+    it 'opens on a 429' do
+      rate_limited = Typesense::Error::HTTPError.new(response: Faraday::Response.new(status: 429))
+                                                .exception('Rate limit exceeded')
+      allow(provider).to receive(:search_client).and_return(RecordingTypesenseClient.new { raise rate_limited })
+
+      3.times { search }
+
+      expect(breaker.state).to eq(:open)
+    end
+
+    it 'opens on a 429 answered for a search inside a multi_search' do
+      allow(provider).to receive(:search_client).and_return(
+        RecordingTypesenseClient.new { |_kind, _params| { 'results' => [{ 'error' => 'Rate limit exceeded', 'code' => 429 }] } }
+      )
+
+      3.times { search }
+
+      expect(breaker.state).to eq(:open)
+      expect(reported.first.last).to eq(:warning)
     end
 
     # A rejected query, a missing collection or a bad key will not pass by

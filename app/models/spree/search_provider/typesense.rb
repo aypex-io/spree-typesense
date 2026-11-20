@@ -26,6 +26,11 @@ module Spree
       # error, as multi_search does per search.
       class SearchError < ::Typesense::Error; end
 
+      # A search multi_search answered with a 429: Typesense is rate limiting.
+      # A 429 to the request itself arrives as the client's HTTPError instead;
+      # see #transient?.
+      class RateLimited < SearchError; end
+
       # Raised by #reindex when a newer reindex took the `__building` marker
       # from it and then stopped without going live: it failed, or someone
       # removed the marker. The collection this reindex built has missed the
@@ -55,14 +60,16 @@ module Spree
       # ::Typesense::Error::Error.
       UNAVAILABLE_ERRORS = [::Typesense::Error, Faraday::Error, *NETWORK_ERRORS, JSON::ParserError].freeze
 
-      # The failures that pass by themselves: timeouts, 5xx, lost connections.
-      # These are reported as warnings. The rest (a rejected query from schema
+      # The failures that pass by themselves: timeouts, 5xx, lost connections,
+      # rate limiting (with #transient?, which also knows the client's 429).
+      # These count towards opening the circuit breaker and are reported as
+      # warnings. The rest (a rejected query from schema
       # drift, a missing collection, a bad API key, missing configuration) will
       # not pass without someone acting, and are reported as errors, so a broken
       # index does not go unnoticed while the Database provider answers.
       TRANSIENT_ERRORS = [
         ::Typesense::Error::TimeoutError, ::Typesense::Error::ServerError, ::Typesense::Error::HTTPStatus0Error,
-        Faraday::Error, *NETWORK_ERRORS, JSON::ParserError
+        RateLimited, Faraday::Error, *NETWORK_ERRORS, JSON::ParserError
       ].freeze
 
       # Raised by #request_typesense in place of a failure in UNAVAILABLE_ERRORS,
@@ -686,7 +693,8 @@ module Spree
         401 => ::Typesense::Error::RequestUnauthorized,
         403 => ::Typesense::Error::RequestUnauthorized,
         404 => ::Typesense::Error::ObjectNotFound,
-        422 => ::Typesense::Error::ObjectUnprocessable
+        422 => ::Typesense::Error::ObjectUnprocessable,
+        429 => RateLimited
       }.freeze
       private_constant :PER_RESULT_ERRORS
 
@@ -822,7 +830,7 @@ module Spree
       def record_unavailable(breaker, error)
         if error.is_a?(::Typesense::Error::MissingConfiguration)
           breaker.release_probe
-        elsif TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) }
+        elsif transient?(error)
           announce_circuit_opened(breaker, error) if breaker.record_failure == :opened
         elsif breaker.record_success == :closed
           Rails.logger.info { '[spree_typesense] Typesense is answering again' }
@@ -876,9 +884,23 @@ module Spree
           "[spree_typesense] Typesense could not answer (#{error.class}: #{error.message}); answering from the " \
           'Database provider. If the collection is missing or out of date, run `rake spree:search:reindex`.'
         end
-        severity = TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) } ? :warning : :error
+        severity = transient?(error) ? :warning : :error
         Rails.error.report(error, handled: true, severity: severity,
                                   context: { collection: collection_name, query: query })
+      end
+
+      # A failure in TRANSIENT_ERRORS, or the client's HTTPError for a 429:
+      # typesense-ruby has no class for that status, and raises HTTPError with
+      # the response for it as for any other status it has no class for.
+      def transient?(error)
+        TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) } || http_status(error) == 429
+      end
+
+      def http_status(error)
+        return unless error.is_a?(::Typesense::Error::HTTPError) && error.data.is_a?(Hash)
+
+        response = error.data[:response]
+        response.status if response.respond_to?(:status)
       end
 
       def unindexed_position_sort?(error)
