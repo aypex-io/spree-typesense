@@ -84,6 +84,18 @@ RSpec.describe Spree::Typesense::ProductPresenter do
     expect(documents.map { |d| d[:id] }).to eq(%w[prod_shirt_en_USD prod_shirt_en_EUR prod_shirt_de_EUR])
   end
 
+  it 'emits one document per currency × locale when two markets share both' do
+    # A Rest-of-World market selling in USD beside the US market. Its locales
+    # are listed in another order, so it is not equal to `us` as a value.
+    row = FakeCatalog::Market.new(currency: 'USD', supported_locales_list: %w[de en], default_locale: 'en')
+    shared = FakeCatalog::Store.new(id: 7, code: 'presenter', markets: [us, eu, row], default_market: us,
+                                    supported_currencies_list: [FakeCatalog::Currency.new('USD')])
+
+    ids = described_class.new(product, shared).call.map { |d| d[:id] }
+
+    expect(ids).to eq(%w[prod_shirt_en_USD prod_shirt_en_EUR prod_shirt_de_EUR prod_shirt_de_USD])
+  end
+
   it 'falls back to the default locale for untranslated fields' do
     expect(document('de', 'EUR')).to include(name: 'Leinenhemd', slug: 'linen-shirt')
   end
@@ -221,6 +233,45 @@ RSpec.describe Spree::Typesense::ProductPresenter do
         allow(orphaned).to receive(:product_categories).and_return([FakeCatalog::Membership.new(nil, 1)])
 
         expect(positions(described_class.new(orphaned, store).call.first)).to eq('pos_coll_x' => 2)
+      end
+    end
+
+    # Each self_and_ancestors is a query (#24).
+    describe 'reading category ancestors' do
+      before do
+        [shirts, sale].each { |category| allow(category).to receive(:self_and_ancestors).and_call_original }
+      end
+
+      it "reads each category's ancestors once per product" do
+        documents
+
+        expect(shirts).to have_received(:self_and_ancestors).once
+        expect(sale).to have_received(:self_and_ancestors).once
+      end
+
+      let(:other) do
+        FakeCatalog::Product.new(prefixed_id: 'prod_other', names: { 'en' => 'Other' },
+                                 prices: { 'USD' => BigDecimal('5') }, categories: [shirts],
+                                 positions: { 'ctg_shirts' => 1 })
+      end
+
+      it 'reads them once across the presenters built while sharing them' do
+        other_document = described_class.sharing_category_ancestors do
+          described_class.new(product, store).call
+          described_class.new(other, store).call.first
+        end
+
+        expect(shirts).to have_received(:self_and_ancestors).once
+        expect(other_document[:category_ids]).to eq(%w[ctg_apparel ctg_shirts])
+        expect(other_document).to include('pos_ctg_apparel' => 1, 'pos_ctg_shirts' => 1)
+      end
+
+      it 'reads them again once the sharing ends' do
+        described_class.sharing_category_ancestors { described_class.new(product, store).call }
+
+        described_class.new(other, store).call
+
+        expect(shirts).to have_received(:self_and_ancestors).twice
       end
     end
 

@@ -103,6 +103,41 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
     expect(live_ids).to eq(['prod_1_en_USD'])
   end
 
+  # So each category's ancestors are read once per batch, not per product
+  # (#24).
+  it "builds each batch's documents sharing the category ancestors they read" do
+    sharing = []
+    allow(Spree::Typesense::ProductPresenter).to receive(:sharing_category_ancestors) do |&block|
+      sharing << :start
+      block.call.tap { sharing << :end }
+    end
+    allow(provider.send(:presenter_class)).to receive(:new) do |p, _store|
+      sharing << p.id
+      instance_double(Spree::Typesense::ProductPresenter, call: [doc_for(p.id)])
+    end
+    yield_batches([product(1), product(2)], [product(3)])
+
+    provider.reindex(relation)
+
+    expect(sharing).to eq([:start, 1, 2, :end, :start, 3, :end])
+  end
+
+  # The README invites subclassing the presenter, and a subclass may define
+  # its own initialize without the cache.
+  it 'reindexes with a presenter subclass whose initialize takes only the product and store' do
+    subclass = Class.new(Spree::Typesense::ProductPresenter) do
+      def initialize(product, store) = super
+
+      def call = [{ 'id' => "prod_#{product.id}_en_USD", 'product_id' => "prod_#{product.id}", 'locale' => 'en',
+                    'currency' => 'USD', 'status' => 'active', 'name' => 'Subclassed', 'in_stock' => true,
+                    'store_ids' => ['1'], 'discontinue_on' => 0, 'units_sold_count' => 0 }]
+    end
+    allow(provider).to receive(:presenter_class).and_return(subclass)
+    yield_batches([product(1)])
+
+    expect(provider.reindex(relation)).to eq(1)
+  end
+
   it 'skips a batch that produces no documents' do
     stub_presenter(5 => [])
     yield_batches([product(5)])
@@ -419,11 +454,11 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
 
     # Building product 1's document from the batch runs `write` first: a save
     # whose index job lands between the reindex's read and its import.
-    def stub_presenter_writing_midway(write)
+    def stub_presenter_writing_midway(write, saved_documents: [doc_for(1, name: 'Renamed mid-reindex')])
       presenter_class = class_double('Spree::Typesense::ProductPresenter')
       allow(provider).to receive(:presenter_class).and_return(presenter_class)
       allow(presenter_class).to receive(:new) do |p, _store|
-        next instance_double(Spree::Typesense::ProductPresenter, call: [doc_for(1, name: 'Renamed mid-reindex')]) if p.equal?(saved)
+        next instance_double(Spree::Typesense::ProductPresenter, call: saved_documents) if p.equal?(saved)
 
         presenter = instance_double(Spree::Typesense::ProductPresenter)
         allow(presenter).to receive(:call) do
@@ -451,6 +486,46 @@ RSpec.describe Spree::SearchProvider::Typesense, '#reindex' do
 
       expect(provider.reindex(relation)).to eq(1)
       expect(live_names).to eq('prod_1_en_USD' => 'Product 1')
+    end
+
+    # A deletion leaves no document stamped `indexed_at` to compare with, so
+    # it leaves a removal marker in the collection being built instead (#27).
+    context 'when the save removes the product' do
+      it 'leaves out a product deleted since the batch was read' do
+        yield_batches([product(1), product(2)])
+        stub_presenter_writing_midway(-> { provider.remove(saved) })
+
+        expect(provider.reindex(relation)).to eq(1)
+        expect(live_ids).to eq(%w[prod_2_en_USD])
+      end
+
+      it 'leaves out a product saved into producing no documents since the batch was read' do
+        yield_batches([product(1), product(2)])
+        stub_presenter_writing_midway(-> { provider.index(saved) }, saved_documents: [])
+
+        expect(provider.reindex(relation)).to eq(1)
+        expect(live_ids).to eq(%w[prod_2_en_USD])
+      end
+
+      it 'still indexes a product removed before the batch was read' do
+        yield_batches([product(1)])
+        stub_presenter_writing_midway(lambda {
+          building = layout.alias_target('products_shop__building')
+          provider.send(:mark_removed, 'prod_1', into: building, removed_at: 0)
+        })
+
+        expect(provider.reindex(relation)).to eq(1)
+        expect(live_ids).to eq(%w[prod_1_en_USD])
+      end
+
+      it 'leaves no removal marker in the live collection' do
+        yield_batches([product(1)])
+        stub_presenter_writing_midway(-> { provider.remove(saved) })
+
+        provider.reindex(relation)
+
+        expect(typesense_client.collections[provider.collection_name].retrieve['num_documents']).to eq(0)
+      end
     end
   end
 end

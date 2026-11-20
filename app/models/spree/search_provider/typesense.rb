@@ -26,6 +26,11 @@ module Spree
       # error, as multi_search does per search.
       class SearchError < ::Typesense::Error; end
 
+      # A search multi_search answered with a 429: Typesense is rate limiting.
+      # A 429 to the request itself arrives as the client's HTTPError instead;
+      # see #transient?.
+      class RateLimited < SearchError; end
+
       # Raised by #reindex when a newer reindex took the `__building` marker
       # from it and then stopped without going live: it failed, or someone
       # removed the marker. The collection this reindex built has missed the
@@ -55,14 +60,16 @@ module Spree
       # ::Typesense::Error::Error.
       UNAVAILABLE_ERRORS = [::Typesense::Error, Faraday::Error, *NETWORK_ERRORS, JSON::ParserError].freeze
 
-      # The failures that pass by themselves: timeouts, 5xx, lost connections.
-      # These are reported as warnings. The rest (a rejected query from schema
+      # The failures that pass by themselves: timeouts, 5xx, lost connections,
+      # rate limiting (with #transient?, which also knows the client's 429).
+      # These count towards opening the circuit breaker and are reported as
+      # warnings. The rest (a rejected query from schema
       # drift, a missing collection, a bad API key, missing configuration) will
       # not pass without someone acting, and are reported as errors, so a broken
       # index does not go unnoticed while the Database provider answers.
       TRANSIENT_ERRORS = [
         ::Typesense::Error::TimeoutError, ::Typesense::Error::ServerError, ::Typesense::Error::HTTPStatus0Error,
-        Faraday::Error, *NETWORK_ERRORS, JSON::ParserError
+        RateLimited, Faraday::Error, *NETWORK_ERRORS, JSON::ParserError
       ].freeze
 
       # Raised by #request_typesense in place of a failure in UNAVAILABLE_ERRORS,
@@ -82,6 +89,11 @@ module Spree
       # Reported once when the circuit breaker opens: Typesense has failed
       # transiently several times in a row, and searches skip it for a while.
       class CircuitOpened < StandardError; end
+
+      # The status of a removal marker (see #mark_removed): not one of Spree's,
+      # so no search, which asks for `active`, can match it.
+      REMOVED_STATUS = '__removed'.freeze
+      private_constant :REMOVED_STATUS
 
       # Set once missing configuration has been logged; see #report_unavailable.
       UNCONFIGURED_LOGGED = Concurrent::AtomicBoolean.new(false)
@@ -106,6 +118,14 @@ module Spree
       # Typesense defaults to 10 facet values per field and truncates silently.
       # Needed by option/category facets; the price range reads stats instead.
       MAX_FACET_VALUES = 100
+
+      # The most searches Typesense takes in one multi_search (its default
+      # `limit_multi_searches`).
+      MULTI_SEARCH_LIMIT = 50
+
+      # The most option values counted by variant per facets request: two
+      # multi_searches. Values beyond it keep their count by product.
+      MAX_VARIANT_COUNTS = 100
 
       # See #schema_client.
       SCHEMA_CHANGE_TIMEOUT_SECONDS = 120
@@ -204,7 +224,9 @@ module Spree
       #
       # Writes to the live collection and, while a reindex is filling one, to
       # that one too, so the change survives the swap. A collection being
-      # built that has since gone (its reindex died) is skipped.
+      # built that has since gone (its reindex died) is skipped. A product
+      # producing no documents leaves a removal marker in the collection being
+      # built (see #mark_removed).
       #
       # Raises ImportError (after the deletion) when Typesense rejects a
       # document, so the index job retries it.
@@ -221,7 +243,8 @@ module Spree
           rescue ImportError => e
             rejected ||= e
           end
-          remove_stale_documents(product.prefixed_id, documents, from: target, written_before: read_at)
+          kept = documents.empty? && !live ? mark_removed(product.prefixed_id, into: target, removed_at: read_at) : documents
+          remove_stale_documents(product.prefixed_id, kept, from: target, written_before: read_at)
         end
         raise rejected if rejected
 
@@ -328,10 +351,13 @@ module Spree
 
       # Composite ids mean one product maps to N documents (locale × currency),
       # so delete by filter on product_id rather than by document id. From the
-      # live collection and any collection a reindex is filling.
+      # live collection and any collection a reindex is filling, where a
+      # removal marker is left in their place (see #mark_removed).
       def remove_by_id(prefixed_id)
-        each_write_target do |target, _live|
-          delete_product_documents(prefixed_id, from: target)
+        removed_at = current_time_ms
+        each_write_target do |target, live|
+          kept = live ? [] : mark_removed(prefixed_id, into: target, removed_at: removed_at)
+          remove_stale_documents(prefixed_id, kept, from: target)
         end
         nil
       end
@@ -401,7 +427,9 @@ module Spree
         # so the scope reaches it without one (#21).
         scope.unscope(:order).preload_associations_lazily.find_in_batches(batch_size: 500) do |batch|
           read_at = current_time_ms
-          documents = batch.flat_map { |product| presenter_class.new(product, store).call }
+          documents = Spree::Typesense::ProductPresenter.sharing_category_ancestors do
+            batch.flat_map { |product| presenter_class.new(product, store).call }
+          end
           documents = without_newer_writes(documents, into: into, read_at: read_at)
           next if documents.empty?
 
@@ -454,6 +482,32 @@ module Spree
       end
 
       def document_product_id(document) = sanitize_prefixed_id(document[:product_id] || document['product_id'])
+
+      # A product removed while a reindex is building, or saved into
+      # producing no documents, leaves no document stamped `indexed_at` there
+      # for #without_newer_writes to find, so a batch that read it earlier
+      # would put its old documents back and take them live (#27). It leaves
+      # this marker in their place: a document stamped with the removal,
+      # which that check finds like any newer write, and which no search can
+      # match, being in no store and in status REMOVED_STATUS. It is written
+      # before the product's documents are deleted, so a batch importing in
+      # between has them deleted after it. The reindex deletes the markers
+      # once it is live. Returns the marker as written, or none when it could
+      # not be: the deletion goes ahead either way.
+      def mark_removed(prefixed_id, into:, removed_at:)
+        marker = { 'id' => "#{prefixed_id}__removed", 'product_id' => prefixed_id, 'locale' => '',
+                   'currency' => '', 'name' => '', 'status' => REMOVED_STATUS, 'in_stock' => false,
+                   'store_ids' => [], 'discontinue_on' => 0, 'units_sold_count' => 0 }
+        index_batch([marker], into: into, indexed_at: removed_at)
+        [marker]
+      rescue ImportError => e
+        Rails.logger.warn { "[spree_typesense] could not mark #{prefixed_id} removed in #{into}: #{e.message}" }
+        []
+      end
+
+      def delete_removal_markers(collection)
+        client.collections[collection].documents.delete(filter_by: "status:=`#{REMOVED_STATUS}`")
+      end
 
       # Forgets a reindex's collection: removes the marker while it is still
       # this reindex's, and drops the collection, leaving the live alias as
@@ -521,6 +575,7 @@ module Spree
         point_live_alias(layout, building)
 
         after_swap("remove the #{layout.building_name} alias") { layout.release!(layout.building_name, building) }
+        after_swap('delete the removal markers') { delete_removal_markers(building) }
         replaced = after_swap('list the collections it replaced') do
           layout.versioned_collections.select { |name| name < building }
         end || []
@@ -577,13 +632,13 @@ module Spree
       end
 
       # Deletes the product's documents in `from` other than `documents`; all
-      # of them when `documents` is empty. Only documents written before
-      # `written_before` go: a later job's are its own business. Ids go into
+      # of them when `documents` is empty. With `written_before`, only
+      # documents written before it go: a later job's are its own business. Ids go into
       # the filter quoted in backticks, Typesense's string literal, because
       # locales such as `en-US` put a hyphen in them. An id that itself holds a
       # backtick cannot be quoted, so nothing is deleted then rather than risk
       # deleting the wrong documents.
-      def remove_stale_documents(prefixed_id, documents, from:, written_before:)
+      def remove_stale_documents(prefixed_id, documents, from:, written_before: nil)
         kept_ids = documents.map { |d| (d[:id] || d['id']).to_s }
         return delete_product_documents(prefixed_id, from: from, written_before: written_before) if kept_ids.empty?
 
@@ -592,10 +647,9 @@ module Spree
           return
         end
 
-        client.collections[from].documents.delete(
-          filter_by: "product_id:=#{sanitize_prefixed_id(prefixed_id)} && " \
-                     "id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}] && indexed_at:<#{written_before.to_i}"
-        )
+        filter = "product_id:=#{sanitize_prefixed_id(prefixed_id)} && id:!=[#{kept_ids.map { |id| "`#{id}`" }.join(',')}]"
+        filter += " && indexed_at:<#{written_before.to_i}" if written_before
+        client.collections[from].documents.delete(filter_by: filter)
       rescue ::Typesense::Error::ObjectNotFound
         nil
       end
@@ -656,9 +710,45 @@ module Spree
         end
 
         results = request_typesense { execute_multi_search(searches) }
-        [results.first,
-         merge_disjunctive_facets(results.first, results.drop(1), option_type_ids),
+        type_of = option_type_of(results.flat_map { |result| option_value_counts(result).keys }.uniq)
+        distribution = merge_disjunctive_facets(results.first, results.drop(1), option_type_ids, type_of)
+        option_counts = request_typesense do
+          count_by_variant(distribution['option_value_ids'] || {}, type_of, query: query, base: base, grouped: grouped)
+        end
+        [results.first, distribution.merge('option_value_ids' => option_counts),
          Facets.normalize_stats(results.first['facet_counts'])]
+      end
+
+      # The option value counts, each as the number of products choosing that
+      # value would list: those with a variant carrying it together with the
+      # values selected of every other option type (#19). The faceted searches
+      # count a product carrying the value on any variant, so with Blue
+      # selected, a product selling a Red XL beside a Blue S counted for XL.
+      # A count search per value fixes that, sent in multi_searches after the
+      # faceted ones, which supply the values. A lone selected type's own
+      # values need none: nothing else is selected for them to sit with.
+      # Neither does a selection the combination tokens cannot answer exactly
+      # (see QueryBuilder.option_conditions), nor any value beyond
+      # MAX_VARIANT_COUNTS: those keep the faceted count. A value no product
+      # has by variant drops out, as Typesense leaves out a value it counts
+      # none of.
+      def count_by_variant(option_counts, type_of, query:, base:, grouped:)
+        selections = option_counts.keys.filter_map { |prefixed_id|
+          option_type_id = type_of[prefixed_id]
+          others = grouped.except(option_type_id)
+          next if option_type_id.nil? || others.empty?
+
+          conditions, exact = QueryBuilder.option_conditions(others.merge(option_type_id => [prefixed_id]))
+          [prefixed_id, conditions] if exact
+        }.first(MAX_VARIANT_COUNTS)
+        return option_counts if selections.empty?
+
+        searches = selections.map do |_prefixed_id, conditions|
+          search_params(query: query, conditions: base + conditions, sort: nil, page: 1, limit: 0)
+        end
+        found = searches.each_slice(MULTI_SEARCH_LIMIT).flat_map { |slice| execute_multi_search(slice) }
+        counted = selections.map(&:first).zip(found.map { |result| result['found'].to_i }).to_h
+        option_counts.merge(counted).reject { |_prefixed_id, count| count.zero? }
       end
 
       # The disjunctive facet searches, in one request.
@@ -686,7 +776,8 @@ module Spree
         401 => ::Typesense::Error::RequestUnauthorized,
         403 => ::Typesense::Error::RequestUnauthorized,
         404 => ::Typesense::Error::ObjectNotFound,
-        422 => ::Typesense::Error::ObjectUnprocessable
+        422 => ::Typesense::Error::ObjectUnprocessable,
+        429 => RateLimited
       }.freeze
       private_constant :PER_RESULT_ERRORS
 
@@ -699,18 +790,17 @@ module Spree
       # Start from the main (fully filtered) distribution, then for each option
       # type overwrite the counts of the values BELONGING TO THAT TYPE with the
       # counts from that type's own relaxed query. Values of other types keep
-      # the main query's counts. Mapping a value to its type needs the database,
-      # same lookup as +group_option_values_by_type+.
-      def merge_disjunctive_facets(main_result, relaxed_results, option_type_ids)
+      # the main query's counts. `type_of` maps a value to its type (see
+      # #option_type_of).
+      def merge_disjunctive_facets(main_result, relaxed_results, option_type_ids, type_of)
         distribution = Facets.normalize(main_result['facet_counts'])
         merged = (distribution['option_value_ids'] || {}).dup
 
         per_type = {}
         relaxed_results.each_with_index do |result, i|
-          per_type[option_type_ids[i]] = Facets.normalize(result['facet_counts'])['option_value_ids'] || {}
+          per_type[option_type_ids[i]] = option_value_counts(result)
         end
 
-        type_of = option_type_of(per_type.values.flat_map(&:keys).uniq)
         per_type.each do |option_type_id, relaxed_distribution|
           relaxed_distribution.each do |prefixed_id, count|
             merged[prefixed_id] = count if type_of[prefixed_id] == option_type_id
@@ -720,7 +810,10 @@ module Spree
         distribution.merge('option_value_ids' => merged)
       end
 
-      # { 'ov_red' => option_type_id, ... } in one query.
+      def option_value_counts(result) = Facets.normalize(result['facet_counts'])['option_value_ids'] || {}
+
+      # { 'ov_red' => option_type_id, ... } in one query, same lookup as
+      # +group_option_values_by_type+.
       def option_type_of(prefixed_ids)
         raw_ids = prefixed_ids.filter_map { |pid| Spree::OptionValue.decode_prefixed_id(pid) }
         by_raw_id = Spree::OptionValue.where(id: raw_ids).pluck(:id, :option_type_id).to_h
@@ -822,7 +915,7 @@ module Spree
       def record_unavailable(breaker, error)
         if error.is_a?(::Typesense::Error::MissingConfiguration)
           breaker.release_probe
-        elsif TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) }
+        elsif transient?(error)
           announce_circuit_opened(breaker, error) if breaker.record_failure == :opened
         elsif breaker.record_success == :closed
           Rails.logger.info { '[spree_typesense] Typesense is answering again' }
@@ -876,9 +969,23 @@ module Spree
           "[spree_typesense] Typesense could not answer (#{error.class}: #{error.message}); answering from the " \
           'Database provider. If the collection is missing or out of date, run `rake spree:search:reindex`.'
         end
-        severity = TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) } ? :warning : :error
+        severity = transient?(error) ? :warning : :error
         Rails.error.report(error, handled: true, severity: severity,
                                   context: { collection: collection_name, query: query })
+      end
+
+      # A failure in TRANSIENT_ERRORS, or the client's HTTPError for a 429:
+      # typesense-ruby has no class for that status, and raises HTTPError with
+      # the response for it as for any other status it has no class for.
+      def transient?(error)
+        TRANSIENT_ERRORS.any? { |klass| error.is_a?(klass) } || http_status(error) == 429
+      end
+
+      def http_status(error)
+        return unless error.is_a?(::Typesense::Error::HTTPError) && error.data.is_a?(Hash)
+
+        response = error.data[:response]
+        response.status if response.respond_to?(:status)
       end
 
       def unindexed_position_sort?(error)

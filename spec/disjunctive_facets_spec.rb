@@ -129,6 +129,176 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
     end
   end
 
+  # With three types selected, each type's relaxed search must drop only its
+  # own selection and keep BOTH others, and each type's counts must come from
+  # its own search. Two types cannot tell those apart from keeping only the
+  # first or the last other type, or from reading the wrong search's counts.
+  # Each relaxed search here asks for two-value combination tokens (#25).
+  context 'across three option types' do
+    let(:size) { FakeOptionType.new(prefixed_id: 'optt_size', name: 'Size', label: 'Size', kind: 'text') }
+    let(:material) do
+      FakeOptionType.new(prefixed_id: 'optt_material', name: 'Material', label: 'Material', kind: 'text')
+    end
+
+    def value(name, type_id, type, position)
+      FakeOptionValue.new(id: name, prefixed_id: "ov_#{name}", name: name, label: name.capitalize,
+                          position: position, color_code: nil, option_type_id: type_id, option_type: type,
+                          image: FakeImage.new(attached: false))
+    end
+
+    # A product with these variants, each a list of option value ids.
+    def doc_with_variants(pid, *variants)
+      doc(pid, variants.flatten.uniq).merge(
+        'option_value_combination_ids' => variants.flat_map { |ids| single_variant_tokens(ids) }.uniq
+      )
+    end
+
+    before do
+      reset_typesense_index!(store.code)
+      bootstrap_index!(provider)
+      provider.index_batch([
+        doc('prod_1', %w[ov_red ov_small ov_cotton]),
+        doc('prod_2', %w[ov_blue ov_small ov_cotton]),
+        doc('prod_3', %w[ov_red ov_large ov_cotton]),
+        doc('prod_4', %w[ov_red ov_large ov_cotton]),
+        doc('prod_5', %w[ov_red ov_small ov_wool]),
+        doc('prod_6', %w[ov_red ov_small ov_wool]),
+        doc('prod_7', %w[ov_red ov_small ov_wool]),
+        doc('prod_8', %w[ov_green ov_large ov_wool]),
+        # Small and cotton, but never on one variant: no colour count for it.
+        doc_with_variants('prod_9', %w[ov_blue ov_small ov_wool], %w[ov_green ov_large ov_cotton])
+      ])
+      green = value('green', 1, colour, 3)
+      stub_ar_lookup(Spree::OptionValue, [red, blue, green, value('small', 2, size, 1), value('large', 2, size, 2),
+                                          value('cotton', 3, material, 1), value('wool', 3, material, 2)])
+    end
+
+    subject(:result) do
+      allow(provider).to receive(:group_option_values_by_type)
+        .and_return(1 => ['ov_red'], 2 => ['ov_small'], 3 => ['ov_cotton'])
+      provider.filters(scope: FakeScope.new((1..9).map { |n| "prod_#{n}" }),
+                       filters: { 'with_option_value_ids' => %w[ov_red ov_small ov_cotton] })
+    end
+
+    def counts_for(type_id)
+      result.filters.find { |f| f[:id] == type_id }[:options].to_h { |o| [o[:id], o[:count]] }
+    end
+
+    it 'counts only the products with a variant of all three selected values' do
+      expect(result.total_count).to eq(1)
+    end
+
+    # Small and cotton on one variant: prod_1 (red) and prod_2 (blue).
+    it 'counts colours keeping both size and material' do
+      expect(counts_for('optt_colour')).to eq('ov_red' => 1, 'ov_blue' => 1)
+    end
+
+    # Red and cotton on one variant: prod_1 (small), prod_3 and prod_4 (large).
+    it 'counts sizes keeping both colour and material' do
+      expect(counts_for('optt_size')).to eq('ov_small' => 1, 'ov_large' => 2)
+    end
+
+    # Red and small on one variant: prod_1 (cotton), prod_5 to prod_7 (wool).
+    it 'counts materials keeping both colour and size' do
+      expect(counts_for('optt_material')).to eq('ov_cotton' => 1, 'ov_wool' => 3)
+    end
+  end
+
+  # A value's count is the number of products choosing it would list: those
+  # with a variant carrying it together with the other types' selected
+  # values, not those carrying it on any variant (#19).
+  context 'counting by variant' do
+    let(:size) { FakeOptionType.new(prefixed_id: 'optt_size', name: 'Size', label: 'Size', kind: 'text') }
+
+    def size_value(name, position)
+      FakeOptionValue.new(id: name, prefixed_id: "ov_#{name}", name: name, label: name.upcase, position: position,
+                          color_code: nil, option_type_id: 2, option_type: size, image: FakeImage.new(attached: false))
+    end
+
+    def doc_with_variants(pid, *variants)
+      doc(pid, variants.flatten.uniq).merge(
+        'option_value_combination_ids' => variants.flat_map { |ids| single_variant_tokens(ids) }.uniq
+      )
+    end
+
+    let(:option_values) { [red, blue, size_value('s', 1), size_value('xl', 2)] }
+
+    before do
+      reset_typesense_index!(store.code)
+      bootstrap_index!(provider)
+      provider.index_batch([
+        # Blue and XL, but never on one variant.
+        doc_with_variants('prod_1', %w[ov_blue ov_s], %w[ov_red ov_xl]),
+        doc_with_variants('prod_2', %w[ov_blue ov_xl]),
+        doc_with_variants('prod_3', %w[ov_blue ov_xl], %w[ov_red ov_xl]),
+        doc_with_variants('prod_4', %w[ov_red ov_s])
+      ])
+      stub_ar_lookup(Spree::OptionValue, option_values)
+    end
+
+    def facets_for(grouped)
+      allow(provider).to receive(:group_option_values_by_type).and_return(grouped)
+      provider.filters(scope: FakeScope.new(%w[prod_1 prod_2 prod_3 prod_4]),
+                       filters: { 'with_option_value_ids' => grouped.values.flatten })
+    end
+
+    def counts_for(result, type_id)
+      result.filters.find { |f| f[:id] == type_id }[:options].to_h { |o| [o[:id], o[:count]] }
+    end
+
+    it "counts another type's values by variant: with Blue selected, a Red XL beside a Blue S is no XL" do
+      expect(counts_for(facets_for(1 => %w[ov_blue]), 'optt_size')).to eq('ov_s' => 1, 'ov_xl' => 2)
+    end
+
+    it 'counts each value as choosing it would list' do
+      xl_count = counts_for(facets_for(1 => %w[ov_blue]), 'optt_size')['ov_xl']
+
+      expect(facets_for(1 => %w[ov_blue], 2 => %w[ov_xl]).total_count).to eq(xl_count)
+    end
+
+    it "counts the selected types' own values by variant too" do
+      result = facets_for(1 => %w[ov_blue], 2 => %w[ov_xl])
+
+      expect(counts_for(result, 'optt_colour')).to eq('ov_blue' => 2, 'ov_red' => 2)
+      expect(counts_for(result, 'optt_size')).to eq('ov_s' => 1, 'ov_xl' => 2)
+    end
+
+    it 'counts a product once when it has the value with several selected values of another type' do
+      expect(counts_for(facets_for(1 => %w[ov_blue ov_red]), 'optt_size')).to eq('ov_s' => 2, 'ov_xl' => 3)
+    end
+
+    it "takes a lone selected type's own counts from the first request, and counts the others' in one more" do
+      allow(provider).to receive(:execute_multi_search).and_call_original
+
+      expect(counts_for(facets_for(1 => %w[ov_blue]), 'optt_colour')).to eq('ov_blue' => 3, 'ov_red' => 3)
+      expect(provider).to have_received(:execute_multi_search).twice
+    end
+
+    # Typesense takes at most 50 searches in one multi_search.
+    context 'with more values than one multi_search can count' do
+      let(:sizes) { (1..60).map { |n| size_value("size#{n}", n) } }
+      let(:option_values) { [red, blue, *sizes] }
+
+      before do
+        reset_typesense_index!(store.code)
+        bootstrap_index!(provider)
+        provider.index_batch(sizes.each_with_index.map do |value, index|
+          # Every product is Blue; only the even ones in their own size.
+          blue_variant = index.even? ? %w[ov_blue] + [value.prefixed_id] : %w[ov_blue]
+          doc_with_variants("prod_#{index}", blue_variant, ['ov_red', value.prefixed_id])
+        end)
+      end
+
+      it 'counts every value by variant' do
+        allow(provider).to receive(:group_option_values_by_type).and_return(1 => %w[ov_blue])
+        result = provider.filters(scope: FakeScope.new((0...60).map { |n| "prod_#{n}" }),
+                                  filters: { 'with_option_value_ids' => %w[ov_blue] })
+
+        expect(counts_for(result, 'optt_size')).to eq(sizes.each_slice(2).to_h { |even, _odd| [even.prefixed_id, 1] })
+      end
+    end
+  end
+
   # THE SHARPEST ENGINE DIVERGENCE IN THIS GEM. A single search raises
   # Typesense::Error::* on a bad filter or a missing collection; multi_search
   # answers HTTP 200 and puts {error, code} in the individual sub-result. A
@@ -172,6 +342,18 @@ RSpec.describe Spree::SearchProvider::Typesense, 'disjunctive faceting' do
     it 'does the same when the MAIN sub-result errors' do
       stub_multi_search([{ 'error' => 'Collection not found', 'code' => 404 }, ok_sub_result])
       expect(result).to eq(:database_filters)
+    end
+
+    # The count searches run after the faceted ones (#19).
+    it 'does the same when a count search errors' do
+      multi = instance_double('Typesense::MultiSearch')
+      allow(multi).to receive(:perform).and_return({ 'results' => [ok_sub_result] * 3 },
+                                                   { 'results' => [{ 'error' => 'Bad filter', 'code' => 400 }] })
+      allow(provider.search_client).to receive(:multi_search).and_return(multi)
+      allow(provider).to receive(:group_option_values_by_type).and_return(1 => ['ov_red'], 2 => ['ov_small'])
+
+      expect(result).to eq(:database_filters)
+      expect(multi).to have_received(:perform).twice
     end
 
     it 'does not raise' do

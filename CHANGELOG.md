@@ -1,5 +1,37 @@
 # Changelog
 
+## 6.0.2 (2026-11-20)
+
+- **Option value counts count by variant** (#19). With option values
+  selected, each value's count is the number of products choosing it would
+  list: those with a variant carrying it together with the other types'
+  selected values. With Blue selected, a product selling a Red XL beside a
+  Blue S no longer counts for XL. The counts come from one more request after
+  the faceted searches (two past 50 values); past 100 values the rest keep
+  counting by product.
+- **Deleting a collection or category re-indexes its products** (#20), on
+  Spree 6.0.4 and later. Spree removes the memberships in a later job without
+  re-indexing; a new subscriber (`Spree::Typesense::MembershipRemovalSubscriber`,
+  registered by the engine) to `product_collection.deleted` and
+  `product_category.deleted` re-indexes each product, so its documents lose
+  the grouping's id and `pos_` field.
+- **One document per currency and locale** (#18). Two markets selling in the
+  same currency and locale (a Rest-of-World market beside the US one) built
+  and sent the same document twice, and the reindex count reported both.
+  Expect a lower count in the reindex log for such a store.
+- **A 429 from Typesense counts as transient** (#26), to the request or to one
+  search of a multi_search: it counts towards opening the circuit breaker and
+  is reported as a warning, rather than counting as Typesense answering and
+  being reported as an error on every search.
+- **A product removed during a reindex stays out of it** (#27). A product
+  deleted, or saved into producing no documents, after the reindex read its
+  batch had its old documents put back and taken live. Its removal now leaves
+  a marker in the collection being built, which no search can match, so the
+  batch leaves the product out; the reindex deletes the markers once live.
+- **A reindex reads each category's ancestors once per batch** (#24), rather
+  than twice per product.
+- Disjunctive facets are specified across three option types (#25).
+
 ## 6.0.1 (2026-11-20)
 
 - **Reindex no longer orders the scope it batches** (#21). `find_in_batches`

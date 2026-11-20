@@ -43,12 +43,12 @@ See [CHANGELOG.md](CHANGELOG.md) for what each release changes.
 
 Searches and filter facets answer from Spree's `Database` provider whenever
 Typesense cannot answer: the connection is refused, the request times out,
-Typesense returns a 5xx, or it rejects the query (a missing collection, a
+Typesense returns a 5xx or rate limits (429), or it rejects the query (a missing collection, a
 filter on a field the collection lacks). On Spree 6 the `Database` provider is
 built with the same `audience:`, so a back-office search stays one. Correct
 results, more slowly, beat an empty page. Each failure is logged at error level
 and reported through `Rails.error` as handled: as a warning when it is
-transient (a timeout, a 5xx, a lost connection), and as an error when it needs
+transient (a timeout, a 5xx, a 429, a lost connection), and as an error when it needs
 someone to act (a rejected query, a missing collection, a bad API key, missing
 configuration), so a broken index does not go unnoticed.
 
@@ -64,7 +64,7 @@ Indexing keeps a 5 second timeout and one retry, and Spree's index jobs retry
 on failure.
 
 During an outage each process stops trying after a while. After three
-transient failures in a row (timeouts, 5xx, lost connections) it skips
+transient failures in a row (timeouts, 5xx, 429s, lost connections) it skips
 Typesense for 30 seconds: searches and facets answer from the `Database`
 provider at once, with nothing logged per search. Opening is logged once at
 error level and reported once through `Rails.error` as a warning
@@ -92,6 +92,10 @@ and with it the documents of products that were deleted or left the scope.
   `products_<store code>__building`, and a product saved meanwhile is written
   to both, so the change survives the swap. A batch the reindex read before
   that save leaves the product out rather than overwrite the newer documents.
+  A product deleted meanwhile, or saved into having no documents (it lost its
+  last price, say), leaves a removal marker in the collection being filled,
+  which no search can match, so such a batch leaves it out too. The reindex
+  deletes the markers once it is live.
 - If a second reindex starts while one is running (a manual rake run during a
   deploy's, say), the second takes the marker and is the one that goes live.
   The first drops its collection when it ends, logs a warning and returns 0.
@@ -133,12 +137,16 @@ and with it the documents of products that were deleted or left the scope.
   `-price`, `name`, `-name`, `available_on`, `-available_on` and
   `best_selling`; any other sort, such as `created_at` or a `cf_*` sort, gets
   the default ranking. `cf_*` sorts are not offered.
-- **Option facet counts are per product.** With values of one option type
-  selected, the counts for another type's values count products that carry
-  the value on any variant: with Blue selected, XL counts a product selling a
-  Red XL beside a Blue S, though choosing XL then lists only products with a
-  Blue XL. The listing and its total are exact; only the counts beside the
-  values can run higher. Spree's Meilisearch provider counts the same way.
+- **Option facet counts with a selection take one more request.** With option
+  values selected, each value's count is the number of products choosing it
+  would list: those with a variant carrying it together with the other types'
+  selected values. With Blue selected, a product selling a Red XL beside a
+  Blue S does not count for XL. Typesense counts facets per document, which is
+  per product here, so these counts come from a count search per value, sent
+  after the faceted searches: one more request, or two past 50 values. Past
+  100 values, or for a selection the index answers only approximately (see
+  the next item), the rest count products carrying the value on any variant,
+  as Spree's Meilisearch provider counts them all.
 - **Values of more than six option types at once.** Values of
   two to six option types must sit on one variant, and the index answers that
   exactly through one token per set of a variant's values. Beyond six types
@@ -181,6 +189,13 @@ is shared by every installed search gem, and another gem's documents
 - **Collections:** documents carry `collection_ids`, and `in_collection`
   filters on it, so a collection listing returns, counts and facets only that
   collection.
+- **Deleted collections and categories:** Spree removes their memberships in
+  a later job without re-indexing the products. On Spree 6.0.4 and later it
+  announces each removed membership, and the gem re-indexes the product then
+  (`Spree::Typesense::MembershipRemovalSubscriber`), so its documents lose the
+  grouping's id and position. On earlier 6.0 releases they keep them until
+  the product is next saved or the store is reindexed; nothing serves a
+  deleted grouping, so only the stale fields remain.
 - **Descriptions** are indexed as plain text
   (`Spree::RichTextHelper.to_plain_text`), so tag names are not searchable.
 - **Base columns are read in the store's content locale.** Spree 6 reads a

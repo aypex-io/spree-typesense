@@ -1,7 +1,7 @@
 module Spree
   module Typesense
     # Builds the Typesense documents for a product: flat, one per
-    # (market × locale) the product is priced in.
+    # (currency × locale) the store's markets sell in and the product is priced in.
     #
     # The fields follow spree_meilisearch 6.0's presenter (categories,
     # option `label`s, storefront-visible custom fields, a plain-text
@@ -11,14 +11,31 @@ module Spree
     # manual sort, documents here carry a `pos_<grouping prefixed id>` field per
     # collection and category instead.
     class ProductPresenter
+      CATEGORY_ANCESTORS = :spree_typesense_category_ancestors
+      private_constant :CATEGORY_ANCESTORS
+
       attr_reader :product, :store
+
+      # Runs the block with the presenters built in it sharing the category
+      # ancestors they read: each category's are one query, so a reindex
+      # builds a batch's documents inside this and reads a category's
+      # ancestors once per batch rather than once per product (#24). Outside
+      # it, a presenter reads a category's once for itself.
+      def self.sharing_category_ancestors
+        outer = ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS]
+        ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS] = outer || {}
+        yield
+      ensure
+        ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS] = outer
+      end
 
       def initialize(product, store)
         @product = product
         @store = store
       end
 
-      # Returns an array of documents — one per market × locale combination.
+      # Returns an array of documents — one per currency × locale the store's
+      # markets sell in.
       # Each document has flat name, description, price fields (no dynamic suffixes).
       def call
         # Indexing runs in a job or a rake task, where nothing has named the
@@ -141,11 +158,15 @@ module Spree
         end
       end
 
-      # Returns all market × locale pairs for this store
+      # The market × locale pairs of this store, one per currency and locale. A
+      # document is identified by its locale and currency, and nothing in it
+      # depends on the market (the price is the product's in that currency), so
+      # two markets sharing both (a Rest-of-World market selling in USD beside
+      # the US one) would otherwise build and send the same document twice.
       def market_locale_pairs
-        @market_locale_pairs ||= store.markets.flat_map do |market|
+        @market_locale_pairs ||= store.markets.flat_map { |market|
           market.supported_locales_list.map { |locale| [market, locale] }
-        end
+        }.uniq { |market, locale| [market.currency, locale.to_s] }
       end
 
       def default_locale
@@ -183,9 +204,14 @@ module Spree
       end
 
       def category_ids_with_ancestors
-        @category_ids_with_ancestors ||= product.categories.flat_map { |c|
-          c.self_and_ancestors.map(&:prefixed_id)
-        }.uniq
+        @category_ids_with_ancestors ||= product.categories.flat_map { |c| self_and_ancestor_ids(c) }.uniq
+      end
+
+      # The prefixed ids of the category and its ancestors, root first, read
+      # once per category (see .sharing_category_ancestors).
+      def self_and_ancestor_ids(category)
+        cache = ActiveSupport::IsolatedExecutionState[CATEGORY_ANCESTORS] || (@category_ancestors ||= {})
+        cache[category.prefixed_id] ||= category.self_and_ancestors.map(&:prefixed_id)
       end
 
       def variant_option_value_ids
@@ -224,8 +250,8 @@ module Spree
           grouping = membership.category
           next if grouping.nil? || membership.position.nil?
 
-          grouping.self_and_ancestors.each do |category|
-            acc[category.prefixed_id] = [acc[category.prefixed_id], membership.position].compact.min
+          self_and_ancestor_ids(grouping).each do |prefixed_id|
+            acc[prefixed_id] = [acc[prefixed_id], membership.position].compact.min
           end
         end
       end
