@@ -52,7 +52,7 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
   # The filters endpoint advertises the sorts a listing offers and which one
   # it starts on, as the Database provider's FiltersAggregator does.
   describe '#filters sort options and default sort' do
-    def collection(sort_order) = Struct.new(:sort_order).new(sort_order)
+    def collection(sort_order) = Struct.new(:sort_order, :prefixed_id).new(sort_order, 'coll_summer')
 
     it "offers 'manual', as the Database provider does, ahead of the field sorts" do
       expect(provider.filters(scope: FakeScope.new([])).sort_options).to eq(
@@ -141,12 +141,13 @@ RSpec.describe Spree::SearchProvider::Typesense, 'search requests' do
     end
 
     # A field sort is Typesense's to apply, and without one grouping 'manual'
-    # has no positions to follow.
+    # has no positions to follow. (An invalid grouping id never reaches
+    # Typesense: the Database provider answers it; see
+    # unanswered_filters_spec.rb.)
     [
       ['a field sort', { filters: { 'in_collection' => 'coll_a' }, sort: 'price' }, 'price:asc'],
       ["'manual' with no grouping", { sort: 'manual' }, nil],
-      ['several categories', { filters: { 'in_categories' => %w[ctg_a ctg_b] } }, nil],
-      ['an invalid grouping id', { filters: { 'in_category' => 'ctg_a || x' } }, nil]
+      ['several categories', { filters: { 'in_categories' => %w[ctg_a ctg_b] } }, nil]
     ].each do |description, args, sort_by|
       it "sends #{description} #{sort_by ? "sorted by #{sort_by}" : 'with no sort'}" do
         search(**args)

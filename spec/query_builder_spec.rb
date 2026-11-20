@@ -114,16 +114,18 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
   end
 
   describe '.user_conditions' do
-    it 'coerces price bounds to numbers so filter syntax cannot be injected' do
+    # Such a price is named by .unanswered_filters, so the Database provider
+    # answers instead.
+    it 'never puts a price that is not a number into the filter' do
       out = described_class.user_conditions(price_gte: '10 || status:=draft')
-      expect(out).to include('price:>=10.0')
-      expect(out.join(' ')).not_to include('draft')
+      expect(out).to be_empty
     end
 
     it 'maps in_stock and out_of_stock' do
       expect(described_class.user_conditions(in_stock: '1')).to include('in_stock:=true')
       expect(described_class.user_conditions(out_of_stock: '1')).to include('in_stock:=false')
       expect(described_class.user_conditions(in_stock: '0')).to be_empty
+      expect(described_class.user_conditions(in_stock: 'false', out_of_stock: 'f')).to be_empty
     end
 
     it 'filters by category using category_ids' do
@@ -177,6 +179,71 @@ RSpec.describe Spree::SearchProvider::Typesense::QueryBuilder do
       expect { described_class.user_conditions(price_gte: ['1']) }.not_to raise_error
       out = described_class.user_conditions(price_gte: ['1'])
       expect(out.first).to eq('price:>=1.0')
+    end
+  end
+
+  # Spree's Database provider applies every filter it is given; one the index
+  # cannot apply exactly is answered there instead, so a listing is never
+  # wider than asked for.
+  describe '.unanswered_filters' do
+    def unanswered(filters) = described_class.unanswered_filters(filters)
+
+    it 'answers the filters it translates' do
+      expect(unanswered('price_gte' => '10', 'price_lte' => '20.5', 'price_between' => %w[10 20],
+                        'in_stock' => '1', 'out_of_stock' => '1', 'in_category' => 'ctg_a',
+                        'in_categories' => %w[ctg_a ctg_b], 'in_taxon' => 'ctg_a', 'in_collection' => 'coll_a',
+                        'with_option_value_ids' => %w[ov_a ov_b])).to be_empty
+    end
+
+    it 'answers what narrows nothing here: the query, not_discontinued, a zero stock flag, blank values' do
+      expect(unanswered('search' => 'tea', 'not_discontinued' => '1', 'in_stock' => '0', 'out_of_stock' => '0',
+                        'name_cont' => '', 'in_categories' => [''], 'with_option_value_ids' => [],
+                        '_category' => nil, '_collection' => nil)).to be_empty
+    end
+
+    it "answers a category or collection page's own grouping" do
+      record = Struct.new(:prefixed_id).new('ctg_tea')
+
+      expect(unanswered('_category' => record, '_collection' => record)).to be_empty
+    end
+
+    it 'names the filters it has no translation for' do
+      expect(unanswered('name_cont' => 'tea', 'search_by_name' => 'tea', 'cf_material' => 'cotton',
+                        'tags_name_in' => %w[new], 's' => 'name asc', 'm' => 'or', 'in_stock' => '1'))
+        .to eq(%w[name_cont search_by_name cf_material tags_name_in s m])
+    end
+
+    it 'names a translated filter whose value it would have to drop or guess' do
+      expect(unanswered('price_gte' => 'cheap', 'price_lte' => 'Infinity', 'price_between' => %w[10],
+                        'in_category' => 'ctg_a || status:=draft', 'in_categories' => %w[ctg_a 5],
+                        'in_collection' => 'coll x', 'with_option_value_ids' => %w[ov_a 7],
+                        '_category' => Struct.new(:prefixed_id).new('ctg_x || 1')))
+        .to eq(%w[price_gte price_lte price_between in_category in_categories in_collection with_option_value_ids
+                  _category])
+    end
+
+    it 'names a price_between that is not two numbers' do
+      expect(unanswered('price_between' => %w[10 x])).to eq(%w[price_between])
+      expect(unanswered('price_between' => '10')).to eq(%w[price_between])
+      expect(unanswered('price_between' => %w[10 20 30])).to eq(%w[price_between])
+    end
+
+    it 'reads symbol keys and request parameters' do
+      params = Struct.new(:hash) { def to_unsafe_h = hash }.new({ name_cont: 'tea', in_stock: '1' })
+
+      expect(unanswered(name_cont: 'tea')).to eq(%w[name_cont])
+      expect(unanswered(params)).to eq(%w[name_cont])
+      expect(unanswered(nil)).to be_empty
+    end
+  end
+
+  describe 'the filters it translates' do
+    it 'filters price_between to the price range, both bounds included' do
+      expect(described_class.user_conditions(price_between: %w[10 20.5])).to eq(['price:[10.0..20.5]'])
+    end
+
+    it 'filters in_taxon, the older name for in_category, by category' do
+      expect(described_class.user_conditions(in_taxon: 'ctg_tea')).to eq(['category_ids:=ctg_tea'])
     end
   end
 

@@ -53,31 +53,62 @@ module Spree
           conditions
         end
 
-        # SECURITY: values here come from Store API query params. Numbers are
-        # coerced with to_f; ids are validated AND stripped; anything invalid is
-        # DROPPED, never repaired. Matches meilisearch.rb#build_filter_condition.
-        def user_conditions(filters)
-          f = filters.respond_to?(:to_unsafe_h) ? filters.to_unsafe_h : filters.to_h
-          f = f.transform_keys(&:to_s)
+        # Returned by #condition_for for a filter the index answers by adding
+        # nothing: the text query, which arrives as `query`; not_discontinued,
+        # which the system conditions already apply; a stock flag set false;
+        # option values, which #option_conditions turns into conditions.
+        NO_CONDITION = :none
 
-          f.filter_map { |key, value| condition_for(key, value) unless value.nil? || value.to_s.empty? }
+        # SECURITY: values here come from Store API query params. Numbers are
+        # parsed, never coerced; ids are validated AND stripped; anything
+        # invalid adds no condition, and #unanswered_filters names it, so the
+        # Database provider answers instead.
+        def user_conditions(filters)
+          present_filters(filters).filter_map do |key, value|
+            condition = condition_for(key, value)
+            condition unless condition == NO_CONDITION
+          end
         end
 
+        # The filters among these the index cannot apply exactly: one it has
+        # no translation for (`name_cont`, `search_by_name`, `cf_*`, any other
+        # Ransack predicate), or a translated one whose value it would have to
+        # drop or guess at (a malformed id, a price that is not a number). The
+        # provider answers a request carrying any from Spree's Database
+        # provider, which applies them all, rather than list more than was
+        # asked for. Blank values filter nothing anywhere and are not named.
+        #
+        # @param filters [Hash, ActionController::Parameters, nil]
+        # @return [Array<String>] their keys
+        def unanswered_filters(filters)
+          present_filters(filters).filter_map { |key, value| key if condition_for(key, value).nil? }
+        end
+
+        # A condition (String), NO_CONDITION, or nil when the index cannot
+        # apply the filter exactly (see #unanswered_filters).
         def condition_for(key, value)
           case key
-          when 'price_gte' then "price:>=#{Array(value).first.to_f}"
-          when 'price_lte' then "price:<=#{Array(value).first.to_f}"
-          when 'in_stock'  then ('in_stock:=true'  if value.to_s != '0')
-          when 'out_of_stock' then ('in_stock:=false' if value.to_s != '0')
-          when 'in_category'
+          when 'search', 'not_discontinued' then NO_CONDITION
+          when 'price_gte'
+            amount = number(Array(value).first)
+            "price:>=#{amount}" if amount
+          when 'price_lte'
+            amount = number(Array(value).first)
+            "price:<=#{amount}" if amount
+          when 'price_between'
+            low, high = Array(value).map { |bound| number(bound) }
+            "price:[#{low}..#{high}]" if Array(value).size == 2 && low && high
+          when 'in_stock'  then false_flag?(value) ? NO_CONDITION : 'in_stock:=true'
+          when 'out_of_stock' then false_flag?(value) ? NO_CONDITION : 'in_stock:=false'
+          when 'in_category', 'in_taxon'
             "category_ids:=#{sanitize_id(value)}" if valid_id?(value)
           when 'in_categories'
-            ids = valid_ids(value)
-            "category_ids:=[#{ids.join(',')}]" if ids.any?
+            ids = present_values(value)
+            "category_ids:=[#{valid_ids(ids).join(',')}]" if ids.all? { |id| valid_id?(id) }
           when 'in_collection'
             "collection_ids:=#{sanitize_id(value)}" if valid_id?(value)
           when 'with_option_value_ids'
-            nil # handled by grouped_option_conditions
+            NO_CONDITION if present_values(value).all? { |id| valid_id?(id) }
           # The records the filters endpoint passes on a category or collection
           # page, so facets and the total cover that grouping only.
           when '_category'
@@ -150,6 +181,26 @@ module Spree
           f = f.transform_keys(&:to_s)
           id = [f['in_collection'], f['in_category']].find { |value| valid_id?(value) }
           sanitize_id(id) if id
+        end
+
+        # The filters with a value: nil, '' and a list of blanks filter
+        # nothing, here or in Spree's Database provider.
+        def present_filters(filters)
+          f = filters.respond_to?(:to_unsafe_h) ? filters.to_unsafe_h : (filters || {}).to_h
+          f.transform_keys(&:to_s).reject { |_key, value| present_values(value).empty? }
+        end
+
+        def present_values(value) = Array(value).reject { |v| v.nil? || v.to_s.empty? }
+
+        # What Ransack takes for false in a boolean scope, which it then
+        # leaves unapplied.
+        def false_flag?(value) = %w[0 f false off].include?(Array(value).first.to_s.downcase)
+
+        # A finite number, or nil: '10 || status:=draft' and 'Infinity' are
+        # not prices.
+        def number(value)
+          amount = value.is_a?(Numeric) ? value.to_f : Float(value.to_s.strip, exception: false)
+          amount if amount&.finite?
         end
 
         def valid_id?(value)  = PREFIXED_ID_PATTERN.match?(value.to_s)
