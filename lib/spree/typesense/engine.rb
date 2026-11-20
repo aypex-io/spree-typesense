@@ -10,6 +10,13 @@ module Spree
       config.after_initialize do
         Spree::Typesense.register_search_product_presenter!
       end
+
+      # Before core activates the subscribers in its own, later,
+      # after_initialize.
+      config.after_initialize do
+        subscriber = Spree::Typesense::MembershipRemovalSubscriber
+        Spree.subscribers << subscriber unless Spree.subscribers.include?(subscriber)
+      end
     end
   end
 end

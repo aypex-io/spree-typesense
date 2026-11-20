@@ -189,6 +189,13 @@ is shared by every installed search gem, and another gem's documents
 - **Collections:** documents carry `collection_ids`, and `in_collection`
   filters on it, so a collection listing returns, counts and facets only that
   collection.
+- **Deleted collections and categories:** Spree removes their memberships in
+  a later job without re-indexing the products. On Spree 6.0.4 and later it
+  announces each removed membership, and the gem re-indexes the product then
+  (`Spree::Typesense::MembershipRemovalSubscriber`), so its documents lose the
+  grouping's id and position. On earlier 6.0 releases they keep them until
+  the product is next saved or the store is reindexed; nothing serves a
+  deleted grouping, so only the stale fields remain.
 - **Descriptions** are indexed as plain text
   (`Spree::RichTextHelper.to_plain_text`), so tag names are not searchable.
 - **Base columns are read in the store's content locale.** Spree 6 reads a

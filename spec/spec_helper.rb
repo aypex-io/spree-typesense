@@ -20,8 +20,11 @@ require File.join(spree_core_root, 'app/models/spree/search_provider/database')
 # storefront scope does. Its fallbacks reach for Spree::Store, which this
 # suite does not have, so every example starts with no channel (see below).
 require File.join(spree_core_root, 'app/models/spree/current')
+# The base of the gem's event subscriber, and the events it receives.
+require File.join(spree_core_root, 'app/models/spree/subscriber')
+require File.join(spree_core_root, 'app/models/spree/event')
 
-Dir[File.join(__dir__, '..', 'app/{models,presenters}/**/*.rb')].sort.each { |f| require f }
+Dir[File.join(__dir__, '..', 'app/{models,presenters,subscribers}/**/*.rb')].sort.each { |f| require f }
 Dir[File.join(__dir__, 'support/**/*.rb')].sort.each { |f| require f }
 
 # spree_core's engine defines both of these in an initializer, which never runs
